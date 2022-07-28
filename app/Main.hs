@@ -16,7 +16,7 @@ import Data.Conduit ((.|), runConduit, ConduitT)
 import qualified Control.Monad.Trans.Resource as CR
 
 data WikiPage = WikiPage Text (Maybe Text) Text deriving Show
-type WikiPageListBuilder = ([WikiPage], Maybe Text, Maybe Text, [Text], [Name])
+type WikiPageBuilder = (Maybe Text, Maybe Text, [Text], [Name])
 
 -- 0: pre <title>
 -- 1: content <title>
@@ -28,47 +28,49 @@ type WikiPageListBuilder = ([WikiPage], Maybe Text, Maybe Text, [Text], [Name])
 -- 7: content <revision> & post </text>
 -- 8: post </revision>
 
-setTitle :: WikiPageListBuilder -> Text -> WikiPageListBuilder
-setTitle (acc,_,r,t,path) v = (acc,Just v,r,t,path)
+setTitle :: WikiPageBuilder -> Text -> WikiPageBuilder
+setTitle (_,r,t,path) v = (Just v,r,t,path)
 
-setRedirect :: WikiPageListBuilder -> Text -> WikiPageListBuilder
-setRedirect (acc,n,_,t,path) v = (acc,n,Just v,t,path)
+setRedirect :: WikiPageBuilder -> Text -> WikiPageBuilder
+setRedirect (n,_,t,path) v = (n,Just v,t,path)
 
-addText :: WikiPageListBuilder -> Text -> WikiPageListBuilder
-addText (acc,n,r,tail,path) v = (acc,n,r,(v:tail),path)
+addText :: WikiPageBuilder -> Text -> WikiPageBuilder
+addText (n,r,tail,path) v = (n,r,(v:tail),path)
 
-pushToXpath :: WikiPageListBuilder -> Name -> WikiPageListBuilder
-pushToXpath (acc,n,r,t,path) started = (acc,n,r,t,started:path)
+pushToXpath :: WikiPageBuilder -> Name -> WikiPageBuilder
+pushToXpath (n,r,t,path) started = (n,r,t,started:path)
 
-popFromXpath :: WikiPageListBuilder -> WikiPageListBuilder
-popFromXpath (acc,n,r,t,ended:path) = (acc,n,r,t,path)
-popFromXpath (acc,n,r,t,[]) = (acc,n,r,t,[]) -- todo: place under MonadThrow ctx to throw here
+popFromXpath :: WikiPageBuilder -> WikiPageBuilder
+popFromXpath (n,r,t,ended:path) = (n,r,t,path)
+popFromXpath (n,r,t,[]) = (n,r,t,[]) -- todo: place under MonadThrow ctx to throw here
 
-onEvent :: WikiPageListBuilder -> Event -> WikiPageListBuilder
-onEvent bldr evt = case evt of
-  (EventBeginElement name attrs) -> onBegin attrs (pushToXpath bldr name)
-  (EventContent (ContentText v)) -> onContent v bldr
-  (EventEndElement _) -> popFromXpath (onEnd bldr)
-  _ -> bldr
+onEvent :: Event -> WikiPageBuilder -> (WikiPageBuilder, [WikiPage])
+onEvent evt bldr = case evt of
+  (EventBeginElement name attrs) -> (onBegin attrs (pushToXpath bldr name), [])
+  (EventContent (ContentText v)) -> (onContent v bldr, [])
+  (EventEndElement _) ->
+    let (nextbldr, res) = onEnd bldr
+    in (popFromXpath nextbldr, res)
+  _ -> (bldr, [])
 
-onBegin :: [(Name, [Content])] -> WikiPageListBuilder -> WikiPageListBuilder
-onBegin [] bldr@(_,_,_,_,["redirect","page"]) = bldr
-onBegin (("title", [ContentText v]):_) bldr@(_,_,_,_,["redirect","page"]) =
-  setTitle bldr v
-onBegin (_:rest) bldr@(_,_,_,_,["redirect","page"]) = onBegin rest bldr
+onBegin :: [(Name, [Content])] -> WikiPageBuilder -> WikiPageBuilder
+onBegin [] bldr@(_,_,_,["redirect","page"]) = bldr
+onBegin (("title", [ContentText v]):_) bldr@(_,_,_,["redirect","page"]) =
+  setRedirect bldr v
+onBegin (_:rest) bldr@(_,_,_,["redirect","page"]) = onBegin rest bldr
 onBegin _ bldr = bldr
 
-onContent :: Text -> WikiPageListBuilder -> WikiPageListBuilder
-onContent v bldr@(_,_,_,_,["title","page"]) = setTitle bldr v
-onContent v bldr@(_,_,_,_,["text","revision","page"]) = addText bldr v
+onContent :: Text -> WikiPageBuilder -> WikiPageBuilder
+onContent v bldr@(_,_,_,["title","page"]) = setTitle bldr v
+onContent v bldr@(_,_,_,["text","revision","page"]) = addText bldr v
 onContent _ bldr = bldr
 
-onEnd :: WikiPageListBuilder -> WikiPageListBuilder
-onEnd (acc,Just n,r,t,["page"]) = do
+onEnd :: WikiPageBuilder -> (WikiPageBuilder, [WikiPage])
+onEnd (Just n,r,t,["page"]) = do
   let parsed = WikiPage n r (T.concat $ reverse t)
-  (parsed:acc,Nothing,Nothing,[],["page"])
-onEnd (acc,_,_,_,["page"]) = (acc,Nothing,Nothing,[],["page"])
-onEnd bldr = bldr
+  ((Nothing,Nothing,[],["page"]), [parsed])
+onEnd (_,_,_,["page"]) = ((Nothing,Nothing,[],["page"]), [])
+onEnd bldr = (bldr, [])
 
 
 -- getWikiPage :: CR.MonadThrow m => ConduitT Event o m (Maybe [(Text, Text)])
@@ -106,6 +108,7 @@ main = do
   result <- runConduit $
     CC.stdin
     .| P.parseBytes def
-    .| CC.foldl onEvent ([],Nothing,Nothing,[],[]) 
-  let (pages,_,_,_,_) = result
-  putStrLn $ foldl (\acc curr -> acc ++ "\n" ++ (show curr)) "" (reverse pages)
+    .| CC.concatMapAccum onEvent (Nothing,Nothing,[],[])
+    .| CC.filter (\(WikiPage _ redir _) -> T.length (fromMaybe "" redir) == 0)
+    .| CC.sinkList
+  putStrLn $ foldl (\acc curr -> acc ++ "\n" ++ (show curr)) "" result
