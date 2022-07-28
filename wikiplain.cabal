@@ -33,7 +33,8 @@ executable wikiplain
         conduit ^>=1.3.4.2,
         bytestring ^>=0.10.10.0,
         text ^>=1.2.4.1,
-        resourcet ^>=1.2.6
+        resourcet ^>=1.2.6,
+        pandoc ^>=2.18
 
     hs-source-dirs:   app
     default-language: Haskell2010
