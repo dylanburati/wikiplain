@@ -1,29 +1,36 @@
 cabal-version:      2.4
 name:               wikiplain
 version:            0.1.0.0
-synopsis:
-
--- A longer description of the package.
--- description:
+synopsis:           Wikimedia dump file manipulation
 homepage:
-
--- A URL where users can report bugs.
--- bug-reports:
-license:            MIT
-license-file:       LICENSE
+license:            NONE
 author:             Dylan Burati
 maintainer:         dylanburati@protonmail.com
 
--- A copyright notice.
--- copyright:
--- category:
 extra-source-files: CHANGELOG.md
 
 executable wikiplain
     main-is:          Main.hs
 
+    build-depends:    base ^>=4.14.3.0,
+        conduit ^>=1.3.4.2,
+        bytestring ^>=0.10.10.0,
+        text ^>=1.2.4.1,
+        resourcet ^>=1.2.6,
+        random ^>=1.2.1.1,
+        attoparsec ^>=0.14.4,
+        direct-sqlite ^>=2.3.27,
+        conduit-extra ^>=1.3.6,
+        mtl ^>=2.3
+
+    hs-source-dirs:   app
+    default-language: Haskell2010
+
+executable wikidump2sqlite
+    main-is:          PopulateDb.hs
+
     -- Modules included in this executable, other than Main.
-    -- other-modules:
+    other-modules:    PhpUpper
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -34,7 +41,10 @@ executable wikiplain
         bytestring ^>=0.10.10.0,
         text ^>=1.2.4.1,
         resourcet ^>=1.2.6,
-        pandoc ^>=2.18
+        random ^>=1.2.1.1,
+        attoparsec ^>=0.14.4,
+        direct-sqlite ^>=2.3.27,
+        vector ^>=0.12.3.1
 
     hs-source-dirs:   app
     default-language: Haskell2010
