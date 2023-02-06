@@ -5,11 +5,14 @@ module Main where
 
 import Numeric (readFloat)
 import GHC.Int (Int64)
+import System.Console.GetOpt
 import System.Environment (getArgs)
+import System.Exit (exitWith, ExitCode(..))
+import System.IO (hPutStrLn, stderr)
 import System.Random (mkStdGen)
 import System.Random.Stateful (newIOGenM, uniformFloat01M, StatefulGen)
 import Data.Char (isLetter, isDigit)
-import Data.List (find, findIndex, mapAccumL)
+import Data.List (find, findIndex, intercalate, mapAccumL)
 import Data.Maybe (fromJust, fromMaybe, isNothing, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -169,6 +172,15 @@ delimitInclusiveAndGroup testL testR lst =
 zipConsec :: [a] -> [(a, a)]
 zipConsec = zip <*> tail
 
+data Conversion
+  = NoTables
+  | NoInvokeTemplates
+  | OnlyLinks
+  | OnlyCategories
+  | OnlyDescriptions
+  | OnlyInfoboxes
+  deriving (Show,Enum,Bounded)
+
 withoutTables :: Text -> Text
 withoutTables t =
   T.unlines $ dropTableContent (T.lines t)
@@ -232,28 +244,25 @@ onlyLinks t =
 onlyTemplates :: Text -> [Text]
 onlyTemplates t = filter (T.isPrefixOf "{{") (breakAroundWikiTemplates t)
 
-convPage :: (Maybe String) -> WikiPage -> WikiPage
-convPage (Just "--no-tables") wp = wp {text = withoutTables (text wp)}
-convPage (Just "--no-invoke-tmpls") wp = wp {text = withoutInvokeTemplates (text wp)}
-convPage (Just "--only-links") wp =
-  wp {text = T.unlines $ onlyLinks (text wp)}
-convPage (Just "--only-categories") wp =
+convPage :: Conversion -> WikiPage -> WikiPage
+convPage NoTables wp = wp {text = withoutTables (text wp)}
+convPage NoInvokeTemplates wp = wp {text = withoutInvokeTemplates (text wp)}
+convPage OnlyLinks wp = wp {text = T.unlines $ onlyLinks (text wp)}
+convPage OnlyCategories wp =
   wp {text = T.unlines $ filter (T.isPrefixOf "[[Category:") $ onlyLinks (text wp)}
-convPage (Just "--only-desc") wp =
+convPage OnlyDescriptions wp =
   wp {text = onlyDesc (text wp)}
   where
     onlyDesc t = fromMaybe "" $
       find (isPrefixOfCI "{{short desc") $
       onlyTemplates t
 
-convPage (Just "--only-infoboxes") wp =
+convPage OnlyInfoboxes wp =
   wp {text = onlyInfoboxes (text wp)}
   where
     onlyInfoboxes t = T.unlines $
       filter (isPrefixOfCI "{{infobox") $
       onlyTemplates t
-
-convPage _ pg = pg
 
 pagesQuery :: Text
 pagesQuery = "SELECT id,ns,title,redirect,text FROM wiki_article "
@@ -327,39 +336,80 @@ loadPagesWithTitles db =
         _ <- QL.bind stmt binds
         pagesFromStmt stmt `finally` (QL.finalize stmt)
 
+conversionName :: Conversion -> String
+conversionName NoTables = "no-tables"
+conversionName NoInvokeTemplates = "no-invoke-tmpls"
+conversionName OnlyLinks = "only-links"
+conversionName OnlyCategories = "only-categories"
+conversionName OnlyDescriptions = "only-desc"
+conversionName OnlyInfoboxes = "only-infoboxes"
+
+conversionByName :: String -> Maybe Conversion
+conversionByName s =
+  conversionByName' s [NoTables ..]
+  where
+    conversionByName' s [] = Nothing
+    conversionByName' s (hd:rest) 
+      | s == (conversionName hd) = Just hd
+      | otherwise                = conversionByName' s rest
+
 data Args = Args
-  { argConversion :: Maybe String
+  { argConversion :: Maybe Conversion
   , argFraction :: Maybe Float
   } deriving Show
 
-parseArgs :: (Monad m) => Args -> (String, String) -> m Args
-parseArgs a ("--fraction", v) = case readFloat v of
-  ((x,_):_) -> return $ a {argFraction = Just x}
-  _         -> throw $ AssertionFailed "Expected float value after --fraction"
-parseArgs a (_, opt)
-  {- opt stores const -}
-  | opt == "--no-tables"        = return $ a {argConversion = Just "--no-tables"}
-  | opt == "--no-invoke-tmpls"  = return $ a {argConversion = Just "--no-invoke-tmpls"}
-  | opt == "--only-links"       = return $ a {argConversion = Just "--only-links"}
-  | opt == "--only-categories"  = return $ a {argConversion = Just "--only-categories"}
-  | opt == "--only-desc"        = return $ a {argConversion = Just "--only-desc"}
-  | opt == "--only-infoboxes"   = return $ a {argConversion = Just "--only-infoboxes"}
-  {- opt requires value -}
-  | opt == "--fraction"         = return a
-  {- unknown opt -}
-  | isListPrefix "--" opt       = throw $ AssertionFailed ("Unknown option: " <> opt)
-  | otherwise                   = throw $ AssertionFailed ("Command takes no arguments")
+addConversionToArgs :: String -> Either String (Args -> Args)
+addConversionToArgs s = case conversionByName s of
+  Just c  -> Right (\args -> args { argConversion = Just c })
+  Nothing -> Left $ "Invalid conversion: " <> s
+
+addFractionToArgs :: String -> Either String (Args -> Args)
+addFractionToArgs s = case readFloat s of
+  ((x,""):_) | x>0, x<=1 -> Right (\args -> args { argFraction = Just x })
+  _                      -> Left $ "Invalid float: " <> s
+
+cliHeader :: String
+cliHeader = "Usage: wikiplain [OPTION...] /path/to/db"
+
+options :: [OptDescr (Either String (Args -> Args))]
+options =
+  [ Option ['c'] ["conversion"] (ReqArg addConversionToArgs "conv")
+      ("The conversion to apply to wikitext (" <> (intercalate "|" (map conversionName [NoTables ..])) <> ")")
+  , Option ['f'] ["fraction"] (ReqArg addFractionToArgs "number")
+      "The fraction of articles to convert; if not provided, the program reads article titles from stdin"
+  , Option ['h'] ["help"] (NoArg (Left "HELP"))
+      "Print this help message"
+  ]
+
+parseArgs :: Args -> [String] -> IO (Args, String)
+parseArgs defaults argv =
+  let (results, params, errs1) = getOpt Permute options argv
+      errs2 = errs1 ++ [msg | Left msg <- results]
+      (param,errs) = case params of
+        [p] -> (p, errs2)
+        []  -> ("", errs2 ++ ["Missing required database file\n"])
+        _   -> ("", errs2 ++ ["Extra arguments after database file\n"])
+      optfns = [fn | Right fn <- results]
+  in case errs of
+    [] ->
+      -- reduction step is Args (Args -> Args) -> Args
+      return (foldl (\acc f -> f acc) defaults optfns, param)
+    lst ->
+      if "HELP" `elem` lst then do
+        hPutStrLn stderr (usageInfo cliHeader options)
+        exitWith ExitSuccess
+      else
+        ioError (userError (unlines lst <> usageInfo cliHeader options))
 
 main :: IO ()
 main = do
   let defaultArgs = Args { argConversion = Nothing
                          , argFraction = Nothing
                          }
-  args <- getArgs >>= (\lst ->
-    foldM parseArgs defaultArgs (zipConsec ("":lst)))
-
+  (args, dbfilename) <- getArgs >>= parseArgs defaultArgs
+  
   rand <- newIOGenM (mkStdGen 1729)
-  withAcquire (mkAcquire (QL.open "../enwiki.db") QL.close) $ \db ->
+  withAcquire (mkAcquire (QL.open (T.pack dbfilename)) QL.close) $ \db ->
     CR.runResourceT $ do
       source <- case (argFraction args) of
         Just x -> return $ loadAllPages db rand x
@@ -368,6 +418,6 @@ main = do
       runConduit $
         source
         .| CC.map (\wp -> wp {text = removeXMLComments (text wp)})
-        .| CC.map (convPage (argConversion args))
+        .| CC.map (maybe id convPage (argConversion args))
         .| CC.mapM_ (\(WikiPage{title = t, text = tx}) ->
             liftIO $ TIO.putStr t >> putChar '\0' >> TIO.putStr tx >> putChar '\0')
