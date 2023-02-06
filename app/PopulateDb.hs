@@ -1,23 +1,24 @@
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ViewPatterns #-}
 module Main where
 
-import Numeric
+import Numeric (readDec)
 import PhpUpper (phpUpper)
 import GHC.Int (Int64)
-import System.Environment
+import System.Environment (getArgs)
 import Data.Char (isLetter, isDigit)
+import Data.Functor ((<&>))
 import Data.List (find, findIndex, mapAccumL)
+import Data.Maybe (fromJust, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import Data.Maybe (fromJust, fromMaybe)
 import Data.XML.Types
+    ( Content(ContentText),
+      Event(EventEndElement, EventBeginElement, EventContent),
+      Name )
 import Text.XML.Stream.Parse (def)
 import qualified Text.XML.Stream.Parse as P
-import Control.Exception
-import Control.Monad
+import Control.Exception (finally)
 import Control.Monad.IO.Class (liftIO)
 import qualified Control.Monad.Trans.Resource as CR
 import Data.Acquire (mkAcquire, withAcquire)
@@ -134,12 +135,12 @@ onContent ["text","revision","page"] wp v =
 onContent _ wp _ = wp
 
 onEnd :: XMLPath -> WikiPagePartial -> (WikiPagePartial, [WikiPage])
-onEnd ["page"] (WikiPagePartial { title' = (t:trest)
+onEnd ["page"] WikiPagePartial { title' = (t:trest)
                                 , ns' = Just n
                                 , pageId' = Just i
                                 , redirect' = r
                                 , text' = txrev
-                                }) = do
+                                } = do
   let tx = T.concat (reverse txrev)
   let ttl = capitalizeFirst $ T.dropAround isXMLSpace $ T.concat (reverse (t:trest))
   let pg = WikiPage { title = ttl
@@ -159,9 +160,18 @@ bindingsql nrows ncols =
     replicate nrows $
     "(" <> (T.intercalate "," (replicate ncols "?")) <> ")"
 
+pagesql :: WikiPage -> [SQLData]
+pagesql WikiPage {title = t, ns = n, pageId = i, redirect = r, text = tx} =
+  [ SQLInteger i
+  , SQLInteger n
+  , SQLText t
+  , maybe SQLNull SQLText r
+  , maybe (SQLText tx) (const SQLNull) r
+  ]
+
 main :: IO ()
 main = do
-  xmlFile <- getArgs >>= (return . head)
+  xmlFile <- getArgs <&> head
   let instext = "INSERT INTO wiki_article (id,ns,title,redirect,text) VALUES "
   let chunkSz = 250
 
@@ -182,14 +192,6 @@ main = do
                 then return (return . const ())
                 else return QL.finalize
 
-              _ <- QL.bind stmt $
-                flip concatMap records
-                  (\(WikiPage {title = t, ns = n, pageId = i, redirect = r, text = tx}) ->
-                      [ SQLInteger i
-                      , SQLInteger n
-                      , SQLText t
-                      , fromMaybe SQLNull (fmap SQLText r)
-                      , fromMaybe (SQLText tx) (fmap (const SQLNull) r)
-                      ])
+              _ <- QL.bind stmt $ concatMap pagesql records
               (QL.stepNoCB stmt >> return ()) `finally` (QL.reset stmt >> final stmt)
         )

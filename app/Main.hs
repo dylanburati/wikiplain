@@ -3,30 +3,31 @@
 {-# LANGUAGE ViewPatterns #-}
 module Main where
 
-import Numeric
+import Numeric (readFloat)
 import GHC.Int (Int64)
-import System.Environment
-import System.IO
+import System.Environment (getArgs)
 import System.Random (mkStdGen)
 import System.Random.Stateful (newIOGenM, uniformFloat01M, StatefulGen)
 import Data.Char (isLetter, isDigit)
 import Data.List (find, findIndex, mapAccumL)
+import Data.Maybe (fromJust, fromMaybe, isNothing, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import Data.Maybe (fromJust, fromMaybe, isNothing)
 import Control.Applicative (liftA2, Alternative ((<|>)))
 import Control.Exception
-import Control.Monad
-import Control.Monad.State
+    (finally, throw, AssertionFailed(AssertionFailed))
+import Control.Monad (foldM)
+import Control.Monad.State (MonadIO(..))
 import Control.Monad.IO.Class (liftIO)
 import qualified Control.Monad.Trans.Resource as CR
 import Data.Acquire (mkAcquire, withAcquire)
-import Data.Conduit ((.|), runConduit, runConduitRes, ConduitT)
+import Data.Conduit ((.|), runConduit, runConduitRes, ConduitT, bracketP)
 import qualified Data.Conduit.Combinators as CC
 import qualified Data.Conduit.List as CL
 import qualified Data.Conduit.Text as CT
 import qualified Data.Conduit.Lift as CLF
+import qualified Data.Vector as V
 import qualified Data.Attoparsec.Text as AT
 import Database.SQLite3 (SQLData (..))
 import qualified Database.SQLite3 as QL
@@ -38,6 +39,9 @@ data WikiPage = WikiPage
   , redirect :: Maybe Text
   , text :: Text
   } deriving Show
+
+emptyWikiPage :: WikiPage
+emptyWikiPage = WikiPage {title = "", ns = 0, pageId = 0, redirect = Just "", text = ""}
 
 pageMeta :: WikiPage -> String
 pageMeta WikiPage {title = t, ns = n, pageId = i} = show (t,n,i)
@@ -122,14 +126,14 @@ breakAroundWikiLinks :: Text -> [Text]
 breakAroundWikiLinks =
   breakAround
     (twoCharBreakBefore (twoCharTest '[' '['))
-    (AT.scan (0,1,'\0') (twoCharDepthScanner '[' '[' ']' ']'))
+    (AT.scan (1,0,'\0') (twoCharDepthScanner '[' '[' ']' ']'))
 
 -- only breaks around top-level templates
 breakAroundWikiTemplates :: Text -> [Text]
 breakAroundWikiTemplates =
   breakAround
     (twoCharBreakBefore (twoCharTest '{' '{'))
-    (AT.scan (0,1,'\0') (twoCharDepthScanner '{' '{' '}' '}'))
+    (AT.scan (1,0,'\0') (twoCharDepthScanner '{' '{' '}' '}'))
 
 breakAroundWikiTemplates' :: Text -> [Text]
 breakAroundWikiTemplates' =
@@ -254,61 +258,56 @@ convPage _ pg = pg
 pagesQuery :: Text
 pagesQuery = "SELECT id,ns,title,redirect,text FROM wiki_article "
 
--- not supposed to put Int directly, since (StateT s m) is a type constraint later
-pagesQueryWithOffset :: (Integral s, Show s) => s -> Text
-pagesQueryWithOffset n =
-  pagesQuery <> "LIMIT 5000 OFFSET " <> (T.pack (show n))
-
 pagesQueryMatchTitles :: Int -> Text
 pagesQueryMatchTitles n =
   pagesQuery <> "WHERE title IN (" <> (T.intercalate "," (replicate n "?")) <> ")"
 
 pagesFromStmt :: (MonadIO m) => QL.Statement -> m [WikiPage]
-pagesFromStmt stmt = do
-  liftIO $ (stepper stmt `finally` (QL.finalize stmt)) >>= (mapM rowToPage)
-  where
-    stepper sqlstmt = do
-      r <- QL.step sqlstmt
-      case r of
-        QL.Row -> (QL.columns sqlstmt) >>= (\row ->
-                    liftA2 (:) (return row) (stepper sqlstmt))
-        QL.Done -> return []
+pagesFromStmt stmt = liftIO $ do
+  r <- QL.step stmt
+  case r of
+    QL.Row -> do
+      row <- QL.columns stmt
+      rest <- pagesFromStmt stmt
+      return ((rowToPage row):rest)
+    QL.Done -> return []
 
-    rowToPage [SQLInteger i,SQLInteger n,SQLText t,r',tx'] =
-      rowToPage2 i n t r' tx'
-    rowToPage _ =
-      throw $ AssertionFailed "Wrong column type for one of: id,ns,title"
-    rowToPage2 i n t SQLNull (SQLText tx) =
-      return $ WikiPage {title = t, ns = n, pageId = i, redirect = Nothing, text = tx}
-    rowToPage2 i n t (SQLText r) SQLNull =
-      return $ WikiPage {title = t, ns = n, pageId = i, redirect = Just r, text = ""}
-    rowToPage2 _ _ _ _ _ =
+rowToPage :: [SQLData] -> WikiPage
+rowToPage [SQLInteger i,SQLInteger n,SQLText t,r',tx'] =
+  case [r',tx'] of
+    [SQLNull,SQLText tx] ->
+      WikiPage {title = t, ns = n, pageId = i, redirect = Nothing, text = tx}
+    [SQLText r,SQLNull] ->
+      WikiPage {title = t, ns = n, pageId = i, redirect = Just r, text = ""}
+    _ ->
       throw $ AssertionFailed "Wrong column type for one of: redirect,text"
+rowToPage _ =
+  throw $ AssertionFailed "Wrong column type for one of: id,ns,title"
 
-loadAllPages :: (MonadIO m, StatefulGen g m)
+
+loadPage :: (MonadIO m) => QL.Statement -> m (Maybe WikiPage)
+loadPage stmt = liftIO $ do
+  r <- QL.step stmt
+  case r of
+    QL.Row -> do
+      row <- QL.columns stmt
+      return $ Just (rowToPage row)
+    QL.Done -> return Nothing
+
+loadAllPages :: (CR.MonadResource m, StatefulGen g m)
              => QL.Database
              -> g
              -> Float
              -> ConduitT () WikiPage m ()
 loadAllPages db rand fraction =
-  CLF.evalStateLC 0 (
-    CC.repeatWhileM (loadPagesSt db) ((> 0) . length)
-      .| CC.concatMap id
-      .| CC.filter (isNothing . redirect)
-    )
+  bracketP (QL.prepare db pagesQuery) QL.finalize $ \stmt ->
+    CC.repeatWhileM (loadPage stmt) isJust
+    .| CC.map (fromMaybe emptyWikiPage)
+    .| CC.filter (isNothing . redirect)
     .| CC.filterM (\_ -> do
-       x <- uniformFloat01M rand
-       return $ x < fraction)
-  where
-    loadPagesSt :: (Integral s, Show s, MonadState s m, MonadIO m)
-                => QL.Database -> m [WikiPage]
-    loadPagesSt db = do
-      offset <- get
-      rows <- liftIO $ do
-        stmt <- QL.prepare db (pagesQueryWithOffset offset)
-        pagesFromStmt stmt
-      _ <- put (offset + 5000)
-      return rows
+      x <- uniformFloat01M rand
+      return $ x < fraction)
+
 
 loadPagesWithTitles :: (CR.MonadThrow m, MonadIO m)
                     => QL.Database
@@ -326,7 +325,7 @@ loadPagesWithTitles db =
       liftIO $ do
         stmt <- QL.prepare db (pagesQueryMatchTitles (length binds))
         _ <- QL.bind stmt binds
-        pagesFromStmt stmt
+        pagesFromStmt stmt `finally` (QL.finalize stmt)
 
 data Args = Args
   { argConversion :: Maybe String
@@ -360,14 +359,15 @@ main = do
     foldM parseArgs defaultArgs (zipConsec ("":lst)))
 
   rand <- newIOGenM (mkStdGen 1729)
-  withAcquire (mkAcquire (QL.open "../enwiki.db") QL.close) $ \db -> do
-    source <- case (argFraction args) of
-      Just x -> return $ loadAllPages db rand x
-      Nothing -> return $ loadPagesWithTitles db  -- read titles from stdin
+  withAcquire (mkAcquire (QL.open "../enwiki.db") QL.close) $ \db ->
+    CR.runResourceT $ do
+      source <- case (argFraction args) of
+        Just x -> return $ loadAllPages db rand x
+        Nothing -> return $ loadPagesWithTitles db  -- read titles from stdin
 
-    runConduit $
-      source
-      .| CC.map (\wp -> wp {text = removeXMLComments (text wp)})
-      .| CC.map (convPage (argConversion args))
-      .| CC.mapM_ (\(WikiPage{title = t, text = tx}) ->
-          liftIO $ TIO.putStr t >> putChar '\0' >> TIO.putStr tx >> putChar '\0')
+      runConduit $
+        source
+        .| CC.map (\wp -> wp {text = removeXMLComments (text wp)})
+        .| CC.map (convPage (argConversion args))
+        .| CC.mapM_ (\(WikiPage{title = t, text = tx}) ->
+            liftIO $ TIO.putStr t >> putChar '\0' >> TIO.putStr tx >> putChar '\0')
