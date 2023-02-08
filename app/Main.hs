@@ -3,7 +3,7 @@
 {-# LANGUAGE ViewPatterns #-}
 module Main where
 
-import Numeric (readFloat)
+import Numeric (readDec, readFloat, showInt)
 import GHC.Int (Int64)
 import System.Console.GetOpt
 import System.Environment (getArgs)
@@ -11,12 +11,13 @@ import System.Exit (exitWith, ExitCode(..))
 import System.IO (hPutStrLn, stderr)
 import System.Random (mkStdGen)
 import System.Random.Stateful (newIOGenM, uniformFloat01M, StatefulGen)
-import Data.Char (isLetter, isDigit)
+import Data.Char (isLetter, isDigit, isSpace)
 import Data.List (find, findIndex, intercalate, mapAccumL)
 import Data.Maybe (fromJust, fromMaybe, isNothing, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import qualified Data.Text.Read as TR
 import Control.Applicative (liftA2, Alternative ((<|>)))
 import Control.Exception
     (finally, throw, AssertionFailed(AssertionFailed))
@@ -264,12 +265,30 @@ convPage OnlyInfoboxes wp =
       filter (isPrefixOfCI "{{infobox") $
       onlyTemplates t
 
-pagesQuery :: Text
-pagesQuery = "SELECT id,ns,title,redirect,text FROM wiki_article "
+renderQuery :: (Text,[Text]) -> Text
+renderQuery (sel,whr) =
+  T.intercalate " " $ sel:((map ((<>) "WHERE ") (take 1 whr))
+                           ++ (map ((<>) "AND ") (drop 1 whr)))
 
-pagesQueryMatchTitles :: Int -> Text
-pagesQueryMatchTitles n =
-  pagesQuery <> "WHERE title IN (" <> (T.intercalate "," (replicate n "?")) <> ")"
+pagesQuerySelect :: Text
+pagesQuerySelect = "SELECT id,ns,title,redirect,text FROM wiki_article"
+
+pagesQuery' :: [Int64] -> (Text,[Text])
+pagesQuery' []  = (pagesQuerySelect, [])
+pagesQuery' nss = (pagesQuerySelect, ["ns IN (" <> (T.intercalate "," (map (const "?") nss)) <> ")"])
+
+pagesQuery :: [Int64] -> Text
+pagesQuery = renderQuery . pagesQuery'
+
+pagesQueryMatchIds' :: [Int64] -> Bool -> Int -> (Text,[Text])
+pagesQueryMatchIds' nss usePageId n =
+  let (sel,whr) = pagesQuery' nss
+      col       = if usePageId then "id" else "title"
+  in (sel,whr ++ [col <> " IN (" <> (T.intercalate "," (replicate n "?")) <> ")"])
+
+pagesQueryMatchIds :: [Int64] -> Bool -> Int -> Text
+pagesQueryMatchIds nss usePageId n =
+  renderQuery $ pagesQueryMatchIds' nss usePageId n
 
 pagesFromStmt :: (MonadIO m) => QL.Statement -> m [WikiPage]
 pagesFromStmt stmt = liftIO $ do
@@ -304,12 +323,16 @@ loadPage stmt = liftIO $ do
     QL.Done -> return Nothing
 
 loadAllPages :: (CR.MonadResource m, StatefulGen g m)
-             => QL.Database
+             => Args
+             -> QL.Database
              -> g
              -> Float
              -> ConduitT () WikiPage m ()
-loadAllPages db rand fraction =
-  bracketP (QL.prepare db pagesQuery) QL.finalize $ \stmt ->
+loadAllPages Args{argNamespaces = nss} db rand fraction =
+  bracketP (QL.prepare db (pagesQuery nss)) QL.finalize $ \stmt -> do
+    _ <- case nss of
+           [] -> return ()
+           l  -> liftIO $ QL.bind stmt (map SQLInteger l)
     CC.repeatWhileM (loadPage stmt) isJust
     .| CC.map (fromMaybe emptyWikiPage)
     .| CC.filter (isNothing . redirect)
@@ -318,10 +341,11 @@ loadAllPages db rand fraction =
       return $ x < fraction)
 
 
-loadPagesWithTitles :: (CR.MonadThrow m, MonadIO m)
-                    => QL.Database
-                    -> ConduitT () WikiPage m ()
-loadPagesWithTitles db =
+loadPagesWithIds :: (CR.MonadThrow m, MonadIO m)
+                 => Args
+                 -> QL.Database
+                 -> ConduitT () WikiPage m ()
+loadPagesWithIds Args{argIntegerIds = usePageId, argNamespaces = nss} db =
   CC.stdin
     .| CT.decode CT.utf8
     .| CT.lines
@@ -330,9 +354,13 @@ loadPagesWithTitles db =
     .| CC.filter (isNothing . redirect)
   where
     loadPagesV db lines = do
-      let binds = map SQLText lines
+      let idBinds = if usePageId
+                    then map SQLInteger [i | Right (i,"") <- map TR.decimal lines] 
+                    else map SQLText lines
+          nsBinds = map SQLInteger nss
+          binds   = nsBinds ++ idBinds
       liftIO $ do
-        stmt <- QL.prepare db (pagesQueryMatchTitles (length binds))
+        stmt <- QL.prepare db (pagesQueryMatchIds nss usePageId (length binds))
         _ <- QL.bind stmt binds
         pagesFromStmt stmt `finally` (QL.finalize stmt)
 
@@ -356,6 +384,8 @@ conversionByName s =
 data Args = Args
   { argConversion :: Maybe Conversion
   , argFraction :: Maybe Float
+  , argIntegerIds :: Bool
+  , argNamespaces :: [Int64]
   } deriving Show
 
 addConversionToArgs :: String -> Either String (Args -> Args)
@@ -368,6 +398,24 @@ addFractionToArgs s = case readFloat s of
   ((x,""):_) | x>0, x<=1 -> Right (\args -> args { argFraction = Just x })
   _                      -> Left $ "Invalid float: " <> s
 
+addNamespacesToArgs :: String -> Either String (Args -> Args)
+addNamespacesToArgs s =
+  case commaSepList s of
+    Left msg -> Left msg
+    Right [] -> Left "At least 1 namespace must be provided"
+    Right lst -> Right (\args -> args { argNamespaces = lst })
+  where
+    commaSepList :: String -> Either String [Int64]
+    commaSepList "" = Right []
+    commaSepList v@(hd:_)
+      | isSpace hd = Left "Namespace list can not include spaces"
+      | otherwise  =
+        case readDec v of
+          (i, rest):_ -> case commaSepList (drop 1 rest) of
+            Left msg  -> Left msg
+            Right lst -> Right (i:lst)
+          _                    -> Left ("Invalid integer(s): " <> v)
+
 cliHeader :: String
 cliHeader = "Usage: wikiplain [OPTION...] /path/to/db"
 
@@ -377,6 +425,10 @@ options =
       ("The conversion to apply to wikitext (" <> (intercalate "|" (map conversionName [NoTables ..])) <> ")")
   , Option ['f'] ["fraction"] (ReqArg addFractionToArgs "number")
       "The fraction of articles to convert; if not provided, the program reads article titles from stdin"
+  , Option []    ["integer-ids"] (NoArg (Right (\args -> args {argIntegerIds = True})))
+      "Read and write page IDs instead of titles"
+  , Option []    ["ns"] (ReqArg addNamespacesToArgs "ns1,ns2,...")
+      "Filter out any articles which don't come from one of the listed namespace IDs (e.g. 0 for regular)"
   , Option ['h'] ["help"] (NoArg (Left "HELP"))
       "Print this help message"
   ]
@@ -401,10 +453,18 @@ parseArgs defaults argv =
       else
         ioError (userError (unlines lst <> usageInfo cliHeader options))
 
+printPage :: Bool -> WikiPage -> IO ()
+printPage False WikiPage{title = t, text = tx} =
+  TIO.putStr t >> putChar '\0' >> TIO.putStr tx >> putChar '\0'
+printPage True WikiPage{pageId = i, text = tx} =
+  putStr (showInt i "") >> putChar '\0' >> TIO.putStr tx >> putChar '\0'
+
 main :: IO ()
 main = do
   let defaultArgs = Args { argConversion = Nothing
                          , argFraction = Nothing
+                         , argIntegerIds = False
+                         , argNamespaces = []
                          }
   (args, dbfilename) <- getArgs >>= parseArgs defaultArgs
   
@@ -412,12 +472,11 @@ main = do
   withAcquire (mkAcquire (QL.open (T.pack dbfilename)) QL.close) $ \db ->
     CR.runResourceT $ do
       source <- case (argFraction args) of
-        Just x -> return $ loadAllPages db rand x
-        Nothing -> return $ loadPagesWithTitles db  -- read titles from stdin
+        Just x -> return $ loadAllPages args db rand x
+        Nothing -> return $ loadPagesWithIds args db  -- read pageIds/titles from stdin
 
       runConduit $
         source
         .| CC.map (\wp -> wp {text = removeXMLComments (text wp)})
         .| CC.map (maybe id convPage (argConversion args))
-        .| CC.mapM_ (\(WikiPage{title = t, text = tx}) ->
-            liftIO $ TIO.putStr t >> putChar '\0' >> TIO.putStr tx >> putChar '\0')
+        .| CC.mapM_ (liftIO . printPage (argIntegerIds args))
