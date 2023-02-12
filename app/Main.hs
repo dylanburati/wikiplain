@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE BangPatterns #-}
 module Main where
 
 import Numeric (readDec, readFloat, showInt)
@@ -110,13 +111,21 @@ twoCharDepthScanner s1 s2 e1 e2 (dist,d,v1) v2
 
 removeXMLComments :: Text -> Text
 removeXMLComments t =
-  T.concat $ uncommented t
+  T.concat (uncommentAcc t [])
   where
-    uncommented "" = []
-    uncommented s =
-      let (pre,cmtplus) = T.breakOn "<!--" s
-          (_,post) = T.breakOn "-->" (T.drop 4 cmtplus)
-      in (:) pre (uncommented (T.drop 3 post))
+    uncommentAcc !s acc
+      | s == ""   = reverse acc
+      | otherwise = let (pre,cmt) = T.breakOn "<!--" s
+                        post = snd $ T.breakOn "-->" cmt
+                    in uncommentAcc (T.drop 3 post) (pre:acc)
+-- removeXMLComments t =
+--   T.concat $ uncommented t
+--   where
+--     uncommented "" = []
+--     uncommented s =
+--       let (pre,cmtplus) = T.breakOn "<!--" s
+--           (_,post) = T.breakOn "-->" (T.drop 4 cmtplus)
+--       in (:) pre (uncommented (T.drop 3 post))
 
 breakAroundTags :: Text -> [Text]
 breakAroundTags =
@@ -274,8 +283,10 @@ pagesQuerySelect :: Text
 pagesQuerySelect = "SELECT id,ns,title,redirect,text FROM wiki_article"
 
 pagesQuery' :: [Int64] -> (Text,[Text])
-pagesQuery' []  = (pagesQuerySelect, [])
-pagesQuery' nss = (pagesQuerySelect, ["ns IN (" <> (T.intercalate "," (map (const "?") nss)) <> ")"])
+pagesQuery' []  = (pagesQuerySelect, ["redirect IS NULL"])
+pagesQuery' nss =
+  (pagesQuerySelect, ["redirect IS NULL",
+                      "ns IN (" <> (T.intercalate "," (map (const "?") nss)) <> ")"])
 
 pagesQuery :: [Int64] -> Text
 pagesQuery = renderQuery . pagesQuery'
@@ -335,7 +346,6 @@ loadAllPages Args{argNamespaces = nss} db rand fraction =
            l  -> liftIO $ QL.bind stmt (map SQLInteger l)
     CC.repeatWhileM (loadPage stmt) isJust
     .| CC.map (fromMaybe emptyWikiPage)
-    .| CC.filter (isNothing . redirect)
     .| CC.filterM (\_ -> do
       x <- uniformFloat01M rand
       return $ x < fraction)
@@ -351,7 +361,6 @@ loadPagesWithIds Args{argIntegerIds = usePageId, argNamespaces = nss} db =
     .| CT.lines
     .| CL.chunksOf 500
     .| CC.concatMapM (loadPagesV db)
-    .| CC.filter (isNothing . redirect)
   where
     loadPagesV db lines = do
       let idBinds = if usePageId
