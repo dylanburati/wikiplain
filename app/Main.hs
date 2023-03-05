@@ -13,8 +13,9 @@ import System.IO (hPutStrLn, stderr)
 import System.Random (mkStdGen)
 import System.Random.Stateful (newIOGenM, uniformFloat01M, StatefulGen)
 import Data.Char (isLetter, isDigit, isSpace)
-import Data.List (find, findIndex, intercalate, mapAccumL)
-import Data.Maybe (fromJust, fromMaybe, isNothing, isJust)
+import Data.Either (fromRight)
+import Data.List (find, findIndex, intercalate, mapAccumL, nub, uncons)
+import Data.Maybe (fromJust, fromMaybe, isNothing, isJust, mapMaybe, catMaybes)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -36,6 +37,7 @@ import qualified Data.Vector as V
 import qualified Data.Attoparsec.Text as AT
 import Database.SQLite3 (SQLData (..))
 import qualified Database.SQLite3 as QL
+import Parse (tokenize, Token (..))
 
 data WikiPage = WikiPage
   { title :: Text
@@ -186,9 +188,11 @@ data Conversion
   = NoTables
   | NoInvokeTemplates
   | OnlyLinks
+  | OnlyLinksExcludingRefs
   | OnlyCategories
   | OnlyDescriptions
   | OnlyInfoboxes
+  | OnlyDisambiguations
   deriving (Show,Enum,Bounded)
 
 withoutTables :: Text -> Text
@@ -254,25 +258,131 @@ onlyLinks t =
 onlyTemplates :: Text -> [Text]
 onlyTemplates t = filter (T.isPrefixOf "{{") (breakAroundWikiTemplates t)
 
+breakAfter :: (a -> Bool) -> [a] -> ([a], [a])
+breakAfter pred [] = ([], [])
+breakAfter pred (hd:tl)
+  | pred hd = ([hd], tl)
+  | otherwise = let (e1, e2) = breakAfter pred tl in (hd:e1, e2)
+
+-- removes Element related tokens, and segments matching
+--   [TokenBeginElement name False] ++ <balanced> ++ [TokenEndElement name]
+--   for any name in the list
+removeElements :: [Text] -> [Token] -> [Token]
+removeElements prohibited tokens =
+  removeElements' (isExcludedBegin prohibited) tokens (0, [])
+  where
+    isExcludedBegin exclLst tk
+      | TokenBeginElement n False <- tk = n `elem` exclLst
+      | otherwise = False
+    removeElements' test [] (_, _) = []
+    removeElements' test (hd:tl) (xDepth, stack)
+      | TokenBeginElement tag False <- hd =
+          let rd = if test hd then xDepth+1 else xDepth
+          in removeElements' test tl (rd, hd:stack)
+      | TokenBeginElement tag True <- hd =
+          removeElements' test tl (xDepth, hd:stack)
+      | TokenBeginTemplate <- hd =
+          consWhen (xDepth == 0) hd $ removeElements' test tl (xDepth, hd:stack)
+      | TokenEndTemplate <- hd =
+          let (dropped, nextStack) = breakAfter (== TokenBeginTemplate) stack
+              rd = xDepth - length (filter test dropped)
+          in consWhen (xDepth == 0) hd $ removeElements' test tl (rd, nextStack)
+      | TokenEndElement tag <- hd =
+          let (dropped, nextStack) = breakAfter (== TokenBeginElement tag False) stack
+              rd = xDepth - length (filter test dropped)
+          in removeElements' test tl (rd, nextStack)
+      | otherwise =
+          consWhen (xDepth == 0) hd $ removeElements' test tl (xDepth, hd:stack)
+    consWhen True = (:)
+    consWhen False = const id
+
+wikiRender :: Token -> Text
+wikiRender (TokenContent c) = c
+wikiRender TokenBeginLink = "[["
+wikiRender TokenEndLink = "]]"
+wikiRender TokenBeginTemplate = "{{"
+wikiRender TokenEndTemplate = "}}"
+wikiRender _ = ""
+
+onlyLinksExcludingRefs :: Text -> [Text]
+onlyLinksExcludingRefs tx =
+  tokensToLinks $ removeElements ["nowiki", "pre", "code", "math", "ref"] (fromRight [] (tokenize tx))
+  where
+    tokensToLinks [] = []
+    tokensToLinks (hd@TokenBeginLink : tl) =
+      let (links, remaining) = unnestLinks tl [[hd]] []
+      in filter (not . isThumbnail) (map renderLink links) ++ tokensToLinks remaining
+    tokensToLinks (hd:tl) = tokensToLinks tl
+    unnestLinks [] _ closedAccs = (closedAccs, [])
+    unnestLinks remaining [] closedAccs = (closedAccs, remaining)
+    unnestLinks (hd@TokenBeginLink : tl) accs closedAccs =
+      unnestLinks tl ([hd] : map (hd :) accs) closedAccs
+    unnestLinks (hd@TokenEndLink : tl) (innerAcc : outerAccs) closedAccs =
+      unnestLinks tl (map (hd :) outerAccs) (reverse (hd:innerAcc) : closedAccs)
+    unnestLinks (hd : tl) accs closedAccs =
+      unnestLinks tl (map (hd :) accs) closedAccs
+    renderLink lst = T.concat $ map wikiRender lst
+    isThumbnail rendered = T.isPrefixOf "[[File:" rendered || T.isPrefixOf "[[Image:" rendered
+
+onlyTemplatesV2 :: Maybe [Text] -> Text -> [Text]
+onlyTemplatesV2 mbNames tx =
+  tokensToTemplates mbNames $ removeElements ["nowiki", "pre", "code"] (fromRight [] (tokenize tx))
+  where
+    tokensToTemplates _ [] = []
+    tokensToTemplates mbNames (hd@TokenBeginTemplate : tl) =
+      let (tmpls, remaining) = unnestTemplates tl [[hd]] []
+      in map renderLink (filter (shouldKeep mbNames) tmpls) ++ tokensToTemplates mbNames remaining
+    tokensToTemplates mbNames (hd:tl) = tokensToTemplates mbNames tl
+    unnestTemplates [] _ closedAccs = (closedAccs, [])
+    unnestTemplates remaining [] closedAccs = (closedAccs, remaining)
+    unnestTemplates (hd@TokenBeginTemplate : tl) accs closedAccs =
+      unnestTemplates tl ([hd] : map (hd :) accs) closedAccs
+    unnestTemplates (hd@TokenEndTemplate : tl) (innerAcc : outerAccs) closedAccs =
+      unnestTemplates tl (map (hd :) outerAccs) (reverse (hd:innerAcc) : closedAccs)
+    unnestTemplates (hd : tl) accs closedAccs =
+      unnestTemplates tl (map (hd :) accs) closedAccs
+    renderLink lst = T.concat $ map wikiRender lst
+    shouldKeep Nothing _ = True
+    shouldKeep (Just names) [] = False
+    shouldKeep (Just names) [_] = False
+    shouldKeep (Just names) (_:(TokenContent inner:_)) =
+      let (nm, _) = T.span valid (T.stripStart inner)
+      in T.toCaseFold (T.stripEnd nm) `elem` names
+    shouldKeep (Just names) _ = False
+    valid '#' = False
+    valid '<' = False
+    valid '>' = False
+    valid '[' = False
+    valid ']' = False
+    valid '|' = False
+    valid '{' = False
+    valid '}' = False
+    valid '_' = False
+    valid _ = True
+
 convPage :: Conversion -> WikiPage -> WikiPage
-convPage NoTables wp = wp {text = withoutTables (text wp)}
-convPage NoInvokeTemplates wp = wp {text = withoutInvokeTemplates (text wp)}
-convPage OnlyLinks wp = wp {text = T.unlines $ onlyLinks (text wp)}
+convPage NoTables wp = wp {text = withoutTables $ removeXMLComments (text wp)}
+convPage NoInvokeTemplates wp = wp {text = withoutInvokeTemplates $ removeXMLComments (text wp)}
+convPage OnlyLinks wp = wp {text = T.unlines $ onlyLinks $ removeXMLComments (text wp)}
+convPage OnlyLinksExcludingRefs wp = wp {text = T.unlines $ onlyLinksExcludingRefs (text wp)}
 convPage OnlyCategories wp =
-  wp {text = T.unlines $ filter (T.isPrefixOf "[[Category:") $ onlyLinks (text wp)}
+  wp {text = T.unlines $ filter (T.isPrefixOf "[[Category:") $ onlyLinks $ removeXMLComments (text wp)}
 convPage OnlyDescriptions wp =
-  wp {text = onlyDesc (text wp)}
+  wp {text = onlyDesc $ removeXMLComments (text wp)}
   where
     onlyDesc t = fromMaybe "" $
       find (isPrefixOfCI "{{short desc") $
       onlyTemplates t
 
 convPage OnlyInfoboxes wp =
-  wp {text = onlyInfoboxes (text wp)}
+  wp {text = onlyInfoboxes $ removeXMLComments (text wp)}
   where
     onlyInfoboxes t = T.unlines $
       filter (isPrefixOfCI "{{infobox") $
       onlyTemplates t
+
+convPage OnlyDisambiguations wp =
+  wp {text = T.unlines $ onlyTemplatesV2 (Just disambiguationTmpls) (text wp)}
 
 renderQuery :: (Text,[Text]) -> Text
 renderQuery (sel,whr) =
@@ -377,9 +487,11 @@ conversionName :: Conversion -> String
 conversionName NoTables = "no-tables"
 conversionName NoInvokeTemplates = "no-invoke-tmpls"
 conversionName OnlyLinks = "only-links"
+conversionName OnlyLinksExcludingRefs = "only-links-excluding-refs"
 conversionName OnlyCategories = "only-categories"
 conversionName OnlyDescriptions = "only-desc"
 conversionName OnlyInfoboxes = "only-infoboxes"
+conversionName OnlyDisambiguations = "only-dab"
 
 conversionByName :: String -> Maybe Conversion
 conversionByName s =
@@ -486,6 +598,157 @@ main = do
 
       runConduit $
         source
-        .| CC.map (\wp -> wp {text = removeXMLComments (text wp)})
         .| CC.map (maybe id convPage (argConversion args))
         .| CC.mapM_ (liftIO . printPage (argIntegerIds args))
+
+-- open encategories.db
+-- ids <- (SELECT cl_from FROM categorylinks WHERE cl_to IN
+--             ('Disambiguation_message_boxes', 'Set_index_article_templates'))
+-- open enwiki.db
+-- titles <- (SELECT title FROM wiki_article WHERE id IN {ids} AND title NOT LIKE '% cleanup')
+-- titles ++ (SELECT title FROM wiki_article WHERE redirect IN {titles})
+
+disambiguationTmpls :: [Text]
+disambiguationTmpls = nub $ map T.toCaseFold [
+  "Dab",
+  "Disamb",
+  "Numdisambig",
+  "Bio-dab",
+  "Hndisambig",
+  "Numdab",
+  "Shortcut disambig",
+  "WP-disambig",
+  "CJKVdab",
+  "Meta disambig",
+  "Disambig-plants",
+  "Geodab",
+  "Hndab",
+  "Geo-dis",
+  "Wikipedia disambiguation",
+  "Sia",
+  "Roaddis",
+  "LatinNameDisambig",
+  "SpeciesLatinNameDisambig",
+  "DAB",
+  "Letter-NumberCombdisambig",
+  "Genus disambig",
+  "WP disambig",
+  "HnDis",
+  "Set index",
+  "Surnames",
+  "Dbig",
+  "Disambig",
+  "Disambiguation page",
+  "Hospitaldis",
+  "Taxonomic authorities disambiguation",
+  "Letter-NumberCombinationDisambiguation",
+  "Airport disambig",
+  "Callsigndis",
+  "Disambig-Chinese-char-title",
+  "MolFormDisambig",
+  "Mathematics disambiguation",
+  "Schooldis",
+  "Personal name disambiguation",
+  "Mathdab",
+  "SIA",
+  "Mountainindex",
+  "Lakeindex",
+  "Mil-unit-disambig",
+  "Schooldab",
+  "Chemdisambig",
+  "Geodisambig",
+  "Chemistry disambiguation",
+  "Molecular formula disambiguation",
+  "MolFormIndex",
+  "LNCD",
+  "Disam",
+  "Letter-Number combination disambiguation",
+  "Letter-NumberCombDisambig",
+  "DisambigName",
+  "DisambigNm",
+  "DisambigN",
+  "Species disambiguation",
+  "Media index",
+  "Project disambiguation",
+  "Sportindex",
+  "Roadindex",
+  "Shipindex",
+  "Set-index",
+  "Case law disambiguation",
+  "Chinese title disambig",
+  "Setindex",
+  "HNDIS",
+  "Set-index article",
+  "First name",
+  "Forename",
+  "Hndis",
+  "Personal name",
+  "Geodis",
+  "Numberdis",
+  "Disambig misspelling",
+  "Begriffsklärung",
+  "Music disambig",
+  "Station dab",
+  "Mil-unit-dis",
+  "Letter-Number Combination Disambiguation",
+  "Portal disambig",
+  "DisambigG",
+  "DisambigGeo",
+  "Disambiggeo",
+  "Chemistry set index",
+  "Math dab",
+  "School disambig",
+  "Human name dab",
+  "Template disambig",
+  "Template dab",
+  "Dis",
+  "Template ambiguous",
+  "Human name disambiguation",
+  "Number disambiguation",
+  "Place name disambiguation",
+  "Ship index",
+  "Surname",
+  "Road index",
+  "School disambiguation",
+  "Disambiguation",
+  "Hospital disambiguation",
+  "Mountain index",
+  "Given name",
+  "Mathematical disambiguation",
+  "Chinese title disambiguation",
+  "Airport disambiguation",
+  "Set index article",
+  "Dmbox",
+  "Sport index",
+  "Call sign disambiguation",
+  "Plant common name",
+  "Lake index",
+  "Molecular formula index",
+  "Species Latin name disambiguation",
+  "Letter-number combination disambiguation",
+  "Species Latin name abbreviation disambiguation",
+  "Genus disambiguation",
+  "Taxonomy disambiguation",
+  "Chemistry index",
+  "Biology disambiguation",
+  "Taxonomic authority disambiguation",
+  "Military unit disambiguation",
+  "Synagogue disambiguation",
+  "Road disambiguation",
+  "Enzyme index",
+  "Media set index",
+  "Caselaw disambiguation",
+  "Fungus common name",
+  "Phonetics disambiguation",
+  "Animal common name",
+  "Storm index",
+  "River index",
+  "Locomotive index",
+  "Nickname",
+  "Music disambiguation",
+  "Station disambiguation",
+  "Portal disambiguation",
+  "Template disambiguation",
+  "Opus number disambiguation",
+  "WoO number disambiguation"
+  ]
