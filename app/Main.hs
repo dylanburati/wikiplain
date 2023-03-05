@@ -8,7 +8,7 @@ import Numeric (readDec, readFloat, showInt)
 import GHC.Int (Int64)
 import System.Console.GetOpt
 import System.Environment (getArgs)
-import System.Exit (exitWith, ExitCode(..))
+import System.Exit (exitSuccess)
 import System.IO (hPutStrLn, stderr)
 import System.Random (mkStdGen)
 import System.Random.Stateful (newIOGenM, uniformFloat01M, StatefulGen)
@@ -360,29 +360,27 @@ onlyTemplatesV2 mbNames tx =
     valid '_' = False
     valid _ = True
 
-convPage :: Conversion -> WikiPage -> WikiPage
-convPage NoTables wp = wp {text = withoutTables $ removeXMLComments (text wp)}
-convPage NoInvokeTemplates wp = wp {text = withoutInvokeTemplates $ removeXMLComments (text wp)}
-convPage OnlyLinks wp = wp {text = T.unlines $ onlyLinks $ removeXMLComments (text wp)}
-convPage OnlyLinksExcludingRefs wp = wp {text = T.unlines $ onlyLinksExcludingRefs (text wp)}
-convPage OnlyCategories wp =
-  wp {text = T.unlines $ filter (T.isPrefixOf "[[Category:") $ onlyLinks $ removeXMLComments (text wp)}
-convPage OnlyDescriptions wp =
-  wp {text = onlyDesc $ removeXMLComments (text wp)}
-  where
-    onlyDesc t = fromMaybe "" $
-      find (isPrefixOfCI "{{short desc") $
-      onlyTemplates t
+convPage :: Conversion -> Text -> Text
+convPage NoTables = withoutTables . removeXMLComments
+convPage NoInvokeTemplates = withoutInvokeTemplates . removeXMLComments
+convPage OnlyLinks = T.unlines . onlyLinks . removeXMLComments
+convPage OnlyLinksExcludingRefs = T.unlines . onlyLinksExcludingRefs
+convPage OnlyCategories =
+  T.unlines . filter (T.isPrefixOf "[[Category:") . onlyLinks . removeXMLComments
+convPage OnlyDescriptions =
+  fromMaybe "" .
+    find (isPrefixOfCI "{{short desc") .
+    onlyTemplates .
+    removeXMLComments
 
-convPage OnlyInfoboxes wp =
-  wp {text = onlyInfoboxes $ removeXMLComments (text wp)}
-  where
-    onlyInfoboxes t = T.unlines $
-      filter (isPrefixOfCI "{{infobox") $
-      onlyTemplates t
+convPage OnlyInfoboxes =
+  T.unlines .
+    filter (isPrefixOfCI "{{infobox") .
+    onlyTemplates .
+    removeXMLComments
 
-convPage OnlyDisambiguations wp =
-  wp {text = T.unlines $ onlyTemplatesV2 (Just disambiguationTmpls) (text wp)}
+convPage OnlyDisambiguations =
+  T.unlines . onlyTemplatesV2 (Just disambiguationTmpls)
 
 renderQuery :: (Text,[Text]) -> Text
 renderQuery (sel,whr) =
@@ -483,6 +481,13 @@ loadPagesWithIds Args{argIntegerIds = usePageId, argNamespaces = nss} db =
         _ <- QL.bind stmt binds
         pagesFromStmt stmt `finally` (QL.finalize stmt)
 
+data ConversionReturnType = OText | OBool deriving Show
+
+convCast :: ConversionReturnType -> Text -> Text
+convCast OText tx = tx
+convCast OBool "" = "0"
+convCast OBool _ = "1"
+
 conversionName :: Conversion -> String
 conversionName NoTables = "no-tables"
 conversionName NoInvokeTemplates = "no-invoke-tmpls"
@@ -493,26 +498,28 @@ conversionName OnlyDescriptions = "only-desc"
 conversionName OnlyInfoboxes = "only-infoboxes"
 conversionName OnlyDisambiguations = "only-dab"
 
-conversionByName :: String -> Maybe Conversion
+conversionByName :: String -> Maybe (Conversion, ConversionReturnType)
 conversionByName s =
   conversionByName' s [NoTables ..]
   where
     conversionByName' s [] = Nothing
     conversionByName' s (hd:rest) 
-      | s == (conversionName hd) = Just hd
-      | otherwise                = conversionByName' s rest
+      | s == (conversionName hd) = Just (hd, OText)
+      | s == (conversionName hd) <> "?" = Just (hd, OBool)
+      | otherwise = conversionByName' s rest
 
 data Args = Args
-  { argConversion :: Maybe Conversion
+  { argConversions :: [(Conversion, ConversionReturnType)]
   , argFraction :: Maybe Float
   , argIntegerIds :: Bool
   , argNamespaces :: [Int64]
   } deriving Show
 
 addConversionToArgs :: String -> Either String (Args -> Args)
-addConversionToArgs s = case conversionByName s of
-  Just c  -> Right (\args -> args { argConversion = Just c })
-  Nothing -> Left $ "Invalid conversion: " <> s
+addConversionToArgs s =
+  case conversionByName s of
+    Just c  -> Right (\args -> args { argConversions = c : argConversions args })
+    Nothing -> Left $ "Invalid conversion: " <> s
 
 addFractionToArgs :: String -> Either String (Args -> Args)
 addFractionToArgs s = case readFloat s of
@@ -570,24 +577,25 @@ parseArgs defaults argv =
     lst ->
       if "HELP" `elem` lst then do
         hPutStrLn stderr (usageInfo cliHeader options)
-        exitWith ExitSuccess
+        exitSuccess
       else
         ioError (userError (unlines lst <> usageInfo cliHeader options))
 
-printPage :: Bool -> WikiPage -> IO ()
-printPage False WikiPage{title = t, text = tx} =
-  TIO.putStr t >> putChar '\0' >> TIO.putStr tx >> putChar '\0'
-printPage True WikiPage{pageId = i, text = tx} =
-  putStr (showInt i "") >> putChar '\0' >> TIO.putStr tx >> putChar '\0'
+identifyPage :: Bool -> WikiPage -> Text
+identifyPage False WikiPage{title = t} = t
+identifyPage True WikiPage{pageId = i} = T.pack (showInt i "")
 
 main :: IO ()
 main = do
-  let defaultArgs = Args { argConversion = Nothing
+  let defaultArgs = Args { argConversions = []
                          , argFraction = Nothing
                          , argIntegerIds = False
                          , argNamespaces = []
                          }
   (args, dbfilename) <- getArgs >>= parseArgs defaultArgs
+  let convFuncs = case (argConversions args) of
+                    [] -> [id]
+                    lst -> [convCast crt . convPage cnv | (cnv, crt) <- reverse lst]
   
   rand <- newIOGenM (mkStdGen 1729)
   withAcquire (mkAcquire (QL.open (T.pack dbfilename)) QL.close) $ \db ->
@@ -598,8 +606,9 @@ main = do
 
       runConduit $
         source
-        .| CC.map (maybe id convPage (argConversion args))
-        .| CC.mapM_ (liftIO . printPage (argIntegerIds args))
+        .| CC.map (\wp -> identifyPage (argIntegerIds args) wp :
+                          map (\f -> f (text wp)) convFuncs)
+        .| CC.mapM_ (liftIO . mapM_ (TIO.putStr <* const (putChar '\0')))
 
 -- open encategories.db
 -- ids <- (SELECT cl_from FROM categorylinks WHERE cl_to IN
