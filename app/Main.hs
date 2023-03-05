@@ -185,45 +185,13 @@ zipConsec :: [a] -> [(a, a)]
 zipConsec = zip <*> tail
 
 data Conversion
-  = NoTables
-  | NoInvokeTemplates
-  | OnlyLinks
-  | OnlyLinksExcludingRefs
-  | OnlyCategories
-  | OnlyDescriptions
-  | OnlyInfoboxes
-  | OnlyDisambiguations
+  = FltrLinks
+  | FltrLinksExcludingRefs
+  | FltrCategories
+  | FltrDescriptions
+  | FltrInfoboxes
+  | FltrDisambiguations
   deriving (Show,Enum,Bounded)
-
-withoutTables :: Text -> Text
-withoutTables t =
-  T.unlines $ dropTableContent (T.lines t)
-  where
-    dropTableContent lines =
-      dropDelimited $ delimitInclusive isTableBegin isTableEnd lines
-    dropDelimited dd = fst $ unzip (filter (not . snd) dd)
-    isTableBegin = T.isPrefixOf "{|"
-    isTableEnd _ = T.isPrefixOf "|}"
-
-withoutInvokeTemplates :: Text -> Text
-withoutInvokeTemplates t =
-  T.concat $ dropInvokeTemplates $
-    zipConsec $
-    (breakAroundWikiTemplates' t) ++ [""]
-  where
-    dropInvokeTemplates consecs =
-      replaceDelimited "1" $
-        map (\((curr,nxt),isDelim) -> (curr,isDelim)) $
-        delimitInclusive isInvokeBegin isInvokeEnd consecs
-    replaceDelimited val lst =
-      snd $ foldr (replaceDelimited1 val) (False,[]) lst
-    replaceDelimited1 val (elt,True) (False,acc) = (True,val:acc)
-    replaceDelimited1 val (elt,True) (True,acc) = (True,acc)
-    replaceDelimited1 val (elt,False) (_,acc) = (False,elt:acc)
-    isInvokeBegin ("{{",nxt) = isPrefixOfCI "#invoke:" nxt
-    isInvokeBegin _ = False
-    isInvokeEnd _ ("}}",_) = True
-    isInvokeEnd _ _ = False
 
 onlyLinksIn :: Text -> [Text]
 onlyLinksIn t =
@@ -361,25 +329,23 @@ onlyTemplatesV2 mbNames tx =
     valid _ = True
 
 convPage :: Conversion -> Text -> Text
-convPage NoTables = withoutTables . removeXMLComments
-convPage NoInvokeTemplates = withoutInvokeTemplates . removeXMLComments
-convPage OnlyLinks = T.unlines . onlyLinks . removeXMLComments
-convPage OnlyLinksExcludingRefs = T.unlines . onlyLinksExcludingRefs
-convPage OnlyCategories =
+convPage FltrLinks = T.unlines . onlyLinks . removeXMLComments
+convPage FltrLinksExcludingRefs = T.unlines . onlyLinksExcludingRefs
+convPage FltrCategories =
   T.unlines . filter (T.isPrefixOf "[[Category:") . onlyLinks . removeXMLComments
-convPage OnlyDescriptions =
+convPage FltrDescriptions =
   fromMaybe "" .
     find (isPrefixOfCI "{{short desc") .
     onlyTemplates .
     removeXMLComments
 
-convPage OnlyInfoboxes =
+convPage FltrInfoboxes =
   T.unlines .
     filter (isPrefixOfCI "{{infobox") .
     onlyTemplates .
     removeXMLComments
 
-convPage OnlyDisambiguations =
+convPage FltrDisambiguations =
   T.unlines . onlyTemplatesV2 (Just disambiguationTmpls)
 
 renderQuery :: (Text,[Text]) -> Text
@@ -489,18 +455,16 @@ convCast OBool "" = "0"
 convCast OBool _ = "1"
 
 conversionName :: Conversion -> String
-conversionName NoTables = "no-tables"
-conversionName NoInvokeTemplates = "no-invoke-tmpls"
-conversionName OnlyLinks = "only-links"
-conversionName OnlyLinksExcludingRefs = "only-links-excluding-refs"
-conversionName OnlyCategories = "only-categories"
-conversionName OnlyDescriptions = "only-desc"
-conversionName OnlyInfoboxes = "only-infoboxes"
-conversionName OnlyDisambiguations = "only-dab"
+conversionName FltrLinks = "links"
+conversionName FltrLinksExcludingRefs = "links-excluding-refs"
+conversionName FltrCategories = "categories"
+conversionName FltrDescriptions = "desc"
+conversionName FltrInfoboxes = "infoboxes"
+conversionName FltrDisambiguations = "dab"
 
 conversionByName :: String -> Maybe (Conversion, ConversionReturnType)
 conversionByName s =
-  conversionByName' s [NoTables ..]
+  conversionByName' s [FltrLinks ..]
   where
     conversionByName' s [] = Nothing
     conversionByName' s (hd:rest) 
@@ -550,7 +514,7 @@ cliHeader = "Usage: wikiplain [OPTION...] /path/to/db"
 options :: [OptDescr (Either String (Args -> Args))]
 options =
   [ Option ['c'] ["conversion"] (ReqArg addConversionToArgs "conv")
-      ("The conversion to apply to wikitext (" <> (intercalate "|" (map conversionName [NoTables ..])) <> ")")
+      ("The conversion to apply to wikitext (" <> (intercalate "|" (map conversionName [FltrLinks ..])) <> ")")
   , Option ['f'] ["fraction"] (ReqArg addFractionToArgs "number")
       "The fraction of articles to convert; if not provided, the program reads article titles from stdin"
   , Option []    ["integer-ids"] (NoArg (Right (\args -> args {argIntegerIds = True})))
@@ -606,9 +570,9 @@ main = do
 
       runConduit $
         source
-        .| CC.map (\wp -> identifyPage (argIntegerIds args) wp :
-                          map (\f -> f (text wp)) convFuncs)
-        .| CC.mapM_ (liftIO . mapM_ (TIO.putStr <* const (putChar '\0')))
+        .| CC.concatMap (\wp -> identifyPage (argIntegerIds args) wp :
+                                map (\f -> f (text wp)) convFuncs)
+        .| CC.mapM_ (liftIO . (\tx -> TIO.putStr tx >> putChar '\0'))
 
 -- open encategories.db
 -- ids <- (SELECT cl_from FROM categorylinks WHERE cl_to IN
