@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "wikiplain"
+name = "pywikiplain"
 version = "0.1.0"
 description = ""
 authors = ["Dylan Burati <dylanburati@protonmail.com>"]
@@ -8,11 +8,26 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.10"
 maturin = "^0.14.15"
+patchelf = "^0.17.2.1"
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.1.1"
+pylint = "^2.17.0"
+black = "^23.1.0"
 
 [build-system]
 requires = ["maturin>=0.14,<0.15"]
 build-backend = "maturin"
 
 [tool.maturin]
-python-source = "python"
 features = ["pyo3/extension-module"]
+
+[tool.pylint]
+[tool.pylint.MAIN]
+extension-pkg-allow-list = "wikiplain"
+
+[tool.pylint.BASIC]
+good-names = ['i,j,k,v,x,y,dx,dy']
+
+[tool.pylint.'MESSAGES CONTROL']
+disable = ['missing-module-docstring', 'R1710', 'R1705', 'superfluous-parens']
