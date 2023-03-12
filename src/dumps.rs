@@ -1,6 +1,5 @@
 use std::{
     cmp::{Eq, Ord, Ordering::*, PartialEq},
-    error::Error,
     fmt::{Debug, Display},
     fs::File,
     io,
@@ -23,9 +22,9 @@ use parquet::{
 };
 use quick_xml::events::{BytesStart, BytesText, Event};
 
-use crate::error::MyError;
+use crate::{ErrorKind, Result, ResultExt};
 
-fn parse_index_bz2(index_path: PathBuf) -> Result<(Vec<u64>, Vec<usize>), Box<dyn Error>> {
+fn parse_index_bz2(index_path: PathBuf) -> Result<(Vec<u64>, Vec<usize>)> {
     let file = File::open(index_path)?;
     let decompressed_reader = BzDecoder::new(file);
     let buffered_reader = BufReader::with_capacity(131072, decompressed_reader);
@@ -51,7 +50,7 @@ fn parse_index_bz2(index_path: PathBuf) -> Result<(Vec<u64>, Vec<usize>), Box<dy
                     current_count += 1;
                 }
                 Less => {
-                    return Err(MyError::new("Index: offset decreased").into());
+                    return Err(ErrorKind::InvalidIndexFile.into());
                 }
             }
         } else {
@@ -219,11 +218,7 @@ impl WikiPagePartial {
     }
 }
 
-fn load_xml_bz2_stream(
-    dump_path: &str,
-    offset: u64,
-    count: usize,
-) -> Result<Vec<WikiPage>, Box<dyn Error>> {
+fn load_xml_bz2_stream(dump_path: &str, offset: u64, count: usize) -> Result<Vec<WikiPage>> {
     let mut file = File::open(dump_path)?;
     file.seek(io::SeekFrom::Start(offset))?;
     let decompressed_reader = BzDecoder::new(file);
@@ -323,7 +318,7 @@ fn arrow_arrays(pages: Vec<WikiPage>) -> [(&'static str, Arc<dyn Array>, bool); 
 
 type ChannelPair<T> = (Sender<T>, Receiver<T>);
 
-pub fn load(dump_path: &str, output_path: &str) -> Result<(), Box<dyn Error>> {
+pub fn load(dump_path: &str, output_path: &str) -> Result<()> {
     let mut index_path = PathBuf::from(dump_path);
     let dump_fname = index_path
         .file_name()
@@ -331,9 +326,7 @@ pub fn load(dump_path: &str, output_path: &str) -> Result<(), Box<dyn Error>> {
         .to_str()
         .ok_or("non-UTF8 file path???")?;
     if dump_fname != "pages-articles-multistream.xml.bz2" {
-        return Err(
-            MyError::new("dump_path must end in 'pages-articles-multistream.xml.bz2'").into(),
-        );
+        return Err(ErrorKind::InvalidArgument("dump_path".to_owned()).into());
     }
     index_path.pop();
     index_path.push("pages-articles-multistream-index.txt.bz2");
@@ -360,7 +353,7 @@ pub fn load(dump_path: &str, output_path: &str) -> Result<(), Box<dyn Error>> {
     eprintln!("Total articles: {}", total_count);
 
     let (src_push, src_pull) = bounded(1);
-    let (sink_push, sink_pull): ChannelPair<Result<(u64, usize, usize), MyError>> = bounded(1);
+    let (sink_push, sink_pull): ChannelPair<Result<(u64, usize, usize)>> = bounded(1);
 
     let n_workers = 10;
     crossbeam::scope(|s| {
@@ -386,30 +379,18 @@ pub fn load(dump_path: &str, output_path: &str) -> Result<(), Box<dyn Error>> {
                             let batch = RecordBatch::try_from_iter_with_nullable(arrays).unwrap();
                             let mut maybe_writer_ref = mutex_ref.lock().unwrap();
                             if let Some(writer_ref) = maybe_writer_ref.as_mut() {
-                                let write_res =
-                                    writer_ref.write(&batch).and_then(|_| writer_ref.flush());
-                                match write_res {
-                                    Ok(_) => {
-                                        sink_push_ref.send(Ok((offset, count, length))).unwrap()
-                                    }
-                                    Err(parquet::errors::ParquetError::ArrowError(msg)) => {
-                                        let detail_msg = format!("{} // {}", msg, batch.schema());
-                                        sink_push_ref.send(Err(MyError::new(detail_msg))).unwrap();
-                                    }
-                                    Err(error) => {
-                                        sink_push_ref.send(Err(MyError::wrap(error))).unwrap();
-                                    }
-                                }
+                                let write_res = writer_ref
+                                    .write(&batch)
+                                    .and_then(|_| writer_ref.flush())
+                                    .chain_err(|| "Worker could not write to parquet")
+                                    .map(|_| (offset, count, length));
+                                sink_push_ref.send(write_res).unwrap();
                             } else {
-                                sink_push_ref
-                                    .send(Err(MyError::new("ArrowWriter gone")))
-                                    .unwrap();
+                                sink_push_ref.send(Err("ArrowWriter gone".into())).unwrap();
                             }
                         }
                         Err(error) => {
-                            sink_push_ref
-                                .send(Err(MyError::new(error.to_string())))
-                                .unwrap();
+                            sink_push_ref.send(Err(error)).unwrap();
                         }
                     }
                 }
