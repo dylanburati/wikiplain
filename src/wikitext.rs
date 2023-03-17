@@ -1,6 +1,7 @@
 use std::{
     cmp::{Eq, PartialEq},
     fmt::{Debug, Display, Write},
+    iter::Peekable,
 };
 
 use lazy_static::lazy_static;
@@ -338,63 +339,95 @@ pub fn get_links(text: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-pub fn get_cite_urls(text: &str) -> Result<Vec<String>> {
-    let tokens = tokenize(text)?;
-    let mut bodies = Vec::new();
-    let mut open_tmpls: Vec<Option<String>> = Vec::new();
-    let mut context = WikiPageContext::new(false);
-    let mut iter = tokens.into_iter().peekable();
-    while let Some(tok) = iter.next() {
-        match tok {
-            Token::ElementStart(_, _) | Token::ElementEnd(_) => {
-                context.update(tok);
-            }
-            Token::TemplateStart => {
-                for s in open_tmpls.iter_mut().flatten() {
-                    *s += "{{";
-                }
-                if context.unclosed_syntax_overrides == 0 {
-                    if matches!(iter.peek(), Some(Token::Content(c)) if c.starts_with("cite web")) {
-                        open_tmpls.push(Some(String::from("")));
-                    } else {
-                        open_tmpls.push(None);
-                    }
-                }
-            }
-            Token::TemplateEnd => {
-                if context.unclosed_syntax_overrides == 0 {
-                    if let Some(Some(tmpl)) = open_tmpls.pop() {
-                        bodies.push(tmpl);
-                    }
-                }
-                for s in open_tmpls.iter_mut().flatten() {
-                    *s += "}}";
-                }
-            }
-            Token::LinkStart => {
-                for s in open_tmpls.iter_mut().flatten() {
-                    *s += "[[";
-                }
-            }
-            Token::LinkEnd => {
-                for s in open_tmpls.iter_mut().flatten() {
-                    *s += "]]";
-                }
-            }
-            Token::Content(c) => {
-                for s in open_tmpls.iter_mut().flatten() {
-                    *s += c;
-                }
-            }
-            _ => continue,
+struct TemplateIterator<'a, F>
+where
+    F: Fn(&str) -> bool,
+{
+    inner: Peekable<std::vec::IntoIter<Token<'a>>>,
+    open_tmpls: Vec<Option<String>>,
+    context: WikiPageContext<'a>,
+    acceptor: F,
+}
+
+impl<'a, F> TemplateIterator<'a, F>
+where
+    F: Fn(&str) -> bool,
+{
+    fn new(tokens: Vec<Token<'a>>, acceptor: F) -> TemplateIterator<'a, F> {
+        TemplateIterator {
+            inner: tokens.into_iter().peekable(),
+            open_tmpls: Vec::new(),
+            context: WikiPageContext::new(false),
+            acceptor,
         }
     }
+}
 
+impl<'a, F> Iterator for TemplateIterator<'a, F>
+where
+    F: Fn(&str) -> bool,
+{
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(tok) = self.inner.next() {
+            match tok {
+                Token::ElementStart(_, _) | Token::ElementEnd(_) => {
+                    self.context.update(tok);
+                }
+                Token::TemplateStart => {
+                    for s in self.open_tmpls.iter_mut().flatten() {
+                        *s += "{{";
+                    }
+                    if self.context.unclosed_syntax_overrides == 0 {
+                        if matches!(self.inner.peek(), Some(Token::Content(c)) if (self.acceptor)(c))
+                        {
+                            self.open_tmpls.push(Some(String::from("")));
+                        } else {
+                            self.open_tmpls.push(None);
+                        }
+                    }
+                }
+                Token::TemplateEnd => {
+                    if self.context.unclosed_syntax_overrides == 0 {
+                        if let Some(Some(tmpl)) = self.open_tmpls.pop() {
+                            return Some(tmpl);
+                        }
+                    }
+                    for s in self.open_tmpls.iter_mut().flatten() {
+                        *s += "}}";
+                    }
+                }
+                Token::LinkStart => {
+                    for s in self.open_tmpls.iter_mut().flatten() {
+                        *s += "[[";
+                    }
+                }
+                Token::LinkEnd => {
+                    for s in self.open_tmpls.iter_mut().flatten() {
+                        *s += "]]";
+                    }
+                }
+                Token::Content(c) => {
+                    for s in self.open_tmpls.iter_mut().flatten() {
+                        *s += c;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        None
+    }
+}
+
+pub fn get_cite_urls(text: &str) -> Result<Vec<String>> {
+    let tokens = tokenize(text)?;
+    let tmpl_iter = TemplateIterator::new(tokens, |title| title.starts_with("cite web"));
     lazy_static! {
         static ref URL_RE: Regex = Regex::new(r"\|\s*url\s*=\s*https?://(?P<url>[^|]+)").unwrap();
     }
 
-    let result: Vec<String> = bodies
+    let result: Vec<String> = tmpl_iter
         .into_iter()
         .flat_map(|s| {
             URL_RE
@@ -404,6 +437,12 @@ pub fn get_cite_urls(text: &str) -> Result<Vec<String>> {
         })
         .collect();
     Ok(result)
+}
+
+pub fn is_disambiguation_page(text: &str) -> Result<bool> {
+    let tokens = tokenize(text)?;
+    let mut tmpl_iter = TemplateIterator::new(tokens, is_disambiguation_tmpl);
+    Ok(tmpl_iter.next().is_some())
 }
 
 fn validate_name(name: &str) -> bool {
@@ -576,5 +615,168 @@ fn validate_name(name: &str) -> bool {
         "frameset" => true,
         "frame" => true,
         _ => false,
+    }
+}
+
+fn parse_tmpl_title(i: &str) -> IResult<&str, String> {
+    let (rest, title) =
+        take_till(|c| matches!(c, '|' | '#' | '<' | '>' | '[' | ']' | '{' | '}' | '_'))(i)?;
+    let mut title_s = title.to_owned();
+    if !title_s.is_empty() {
+        if let Some(prefix) = title_s.get_mut(0..1) {
+            prefix.make_ascii_uppercase();
+        }
+    }
+    Ok((rest, title_s))
+}
+
+fn is_disambiguation_tmpl(title: &str) -> bool {
+    if let Ok((_, title_u1)) = parse_tmpl_title(title) {
+        matches!(
+            title_u1.as_str(),
+            "Dab"
+                | "Disamb"
+                | "Numdisambig"
+                | "Bio-dab"
+                | "Hndisambig"
+                | "Numdab"
+                | "Shortcut disambig"
+                | "WP-disambig"
+                | "CJKVdab"
+                | "Meta disambig"
+                | "Disambig-plants"
+                | "Geodab"
+                | "Hndab"
+                | "Geo-dis"
+                | "Wikipedia disambiguation"
+                | "Sia"
+                | "Roaddis"
+                | "LatinNameDisambig"
+                | "SpeciesLatinNameDisambig"
+                | "DAB"
+                | "Letter-NumberCombdisambig"
+                | "Genus disambig"
+                | "WP disambig"
+                | "HnDis"
+                | "Set index"
+                | "Surnames"
+                | "Dbig"
+                | "Disambig"
+                | "Disambiguation page"
+                | "Hospitaldis"
+                | "Taxonomic authorities disambiguation"
+                | "Letter-NumberCombinationDisambiguation"
+                | "Airport disambig"
+                | "Callsigndis"
+                | "Disambig-Chinese-char-title"
+                | "MolFormDisambig"
+                | "Mathematics disambiguation"
+                | "Schooldis"
+                | "Personal name disambiguation"
+                | "Mathdab"
+                | "SIA"
+                | "Mountainindex"
+                | "Lakeindex"
+                | "Mil-unit-disambig"
+                | "Schooldab"
+                | "Chemdisambig"
+                | "Geodisambig"
+                | "Chemistry disambiguation"
+                | "Molecular formula disambiguation"
+                | "MolFormIndex"
+                | "LNCD"
+                | "Disam"
+                | "Letter-Number combination disambiguation"
+                | "Letter-NumberCombDisambig"
+                | "DisambigName"
+                | "DisambigNm"
+                | "DisambigN"
+                | "Species disambiguation"
+                | "Media index"
+                | "Project disambiguation"
+                | "Sportindex"
+                | "Roadindex"
+                | "Shipindex"
+                | "Set-index"
+                | "Case law disambiguation"
+                | "Chinese title disambig"
+                | "Setindex"
+                | "HNDIS"
+                | "Set-index article"
+                | "First name"
+                | "Forename"
+                | "Hndis"
+                | "Personal name"
+                | "Geodis"
+                | "Numberdis"
+                | "Disambig misspelling"
+                | "Begriffsklärung"
+                | "Music disambig"
+                | "Station dab"
+                | "Mil-unit-dis"
+                | "Letter-Number Combination Disambiguation"
+                | "Portal disambig"
+                | "DisambigG"
+                | "DisambigGeo"
+                | "Disambiggeo"
+                | "Chemistry set index"
+                | "Math dab"
+                | "School disambig"
+                | "Human name dab"
+                | "Template disambig"
+                | "Template dab"
+                | "Dis"
+                | "Template ambiguous"
+                | "Human name disambiguation"
+                | "Number disambiguation"
+                | "Place name disambiguation"
+                | "Ship index"
+                | "Surname"
+                | "Road index"
+                | "School disambiguation"
+                | "Disambiguation"
+                | "Hospital disambiguation"
+                | "Mountain index"
+                | "Given name"
+                | "Mathematical disambiguation"
+                | "Chinese title disambiguation"
+                | "Airport disambiguation"
+                | "Set index article"
+                | "Dmbox"
+                | "Sport index"
+                | "Call sign disambiguation"
+                | "Plant common name"
+                | "Lake index"
+                | "Molecular formula index"
+                | "Species Latin name disambiguation"
+                | "Letter-number combination disambiguation"
+                | "Species Latin name abbreviation disambiguation"
+                | "Genus disambiguation"
+                | "Taxonomy disambiguation"
+                | "Chemistry index"
+                | "Biology disambiguation"
+                | "Taxonomic authority disambiguation"
+                | "Military unit disambiguation"
+                | "Synagogue disambiguation"
+                | "Road disambiguation"
+                | "Enzyme index"
+                | "Media set index"
+                | "Caselaw disambiguation"
+                | "Fungus common name"
+                | "Phonetics disambiguation"
+                | "Animal common name"
+                | "Storm index"
+                | "River index"
+                | "Locomotive index"
+                | "Nickname"
+                | "Music disambiguation"
+                | "Station disambiguation"
+                | "Portal disambiguation"
+                | "Template disambiguation"
+                | "Opus number disambiguation"
+                | "WoO number disambiguation"
+        )
+    } else {
+        false
     }
 }

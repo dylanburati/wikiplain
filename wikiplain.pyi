@@ -9,3 +9,6 @@ def get_links(text: str) -> list[str]:
 
 def get_cite_urls(text: str) -> list[str]:
     """Extract the URLs used in web citations from a Wikitext string."""
+
+def is_diambiguation_page(text: str) -> bool:
+    """Detect whether the Wikitext string has a disambiguation marker template."""

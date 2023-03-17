@@ -18,6 +18,13 @@ arsenal = {git = "https://github.com/timvieira/arsenal.git"}
 polars = "^0.16.12"
 pyarrow = "^11.0.0"
 tqdm = "^4.65.0"
+ijson = "^3.2.0.post0"
+spacy = "^3.5.1"
+transformers = "^4.26.1"
+cytoolz = "^0.12.1"
+mmh3 = "^3.0.0"
+zstandard = "^0.20.0"
+httpx = "^0.23.3"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.1.1"
@@ -36,7 +43,7 @@ features = ["pyo3/extension-module"]
 extension-pkg-allow-list = "wikiplain"
 
 [tool.pylint.BASIC]
-good-names = ['i,j,k,v,x,y,dx,dy']
+good-names = ['i,j,k,v,x,y,dx,dy,fp']
 
 [tool.pylint.'MESSAGES CONTROL']
 disable = ['missing-module-docstring', 'R1710', 'R1705', 'superfluous-parens']

@@ -53,6 +53,12 @@ fn get_cite_urls(text: &str) -> PyResult<Vec<String>> {
         .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+#[pyfunction]
+fn is_disambiguation_page(text: &str) -> PyResult<bool> {
+    wikitext::is_disambiguation_page(text)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn wikiplain(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -60,5 +66,6 @@ fn wikiplain(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(test_parser, m)?)?;
     m.add_function(wrap_pyfunction!(get_links, m)?)?;
     m.add_function(wrap_pyfunction!(get_cite_urls, m)?)?;
+    m.add_function(wrap_pyfunction!(is_disambiguation_page, m)?)?;
     Ok(())
 }
