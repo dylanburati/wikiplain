@@ -1,5 +1,4 @@
 import glob
-import itertools
 import json
 import sys
 from concurrent.futures import as_completed, ProcessPoolExecutor

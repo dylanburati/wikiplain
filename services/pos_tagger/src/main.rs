@@ -6,11 +6,14 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry::*;
 use std::collections::{HashMap, LinkedList};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, TcpListener};
+use std::sync::{Arc, Mutex};
 
+use crossbeam::channel::bounded;
 use error_chain::error_chain;
 use serde::{Deserialize, Serialize};
+use serde_json::de::Deserializer;
 
 error_chain! {
     foreign_links {
@@ -234,13 +237,12 @@ impl TryFrom<i32> for Verb {
 
 fn train<I>(model: &mut AveragedPerceptron, input: &mut I) -> Result<f32>
 where
-    I: Iterator<Item = std::io::Result<String>>,
+    I: Iterator<Item = serde_json::Result<Vec<(String, usize)>>>,
 {
     let mut correct = 0u64;
     let mut total = 0u64;
-    for (sentence_num, piece_res) in input.enumerate() {
-        let piece = piece_res?;
-        let sentence: Vec<(String, usize)> = serde_json::from_str(piece.as_str())?;
+    for (sentence_num, sentence_res) in input.enumerate() {
+        let sentence: Vec<(String, usize)> = sentence_res?;
         let mut context = vec!["_START2".to_owned(), "_START1".to_owned()];
         context.extend(sentence.iter().cloned().map(|e| e.0));
         context.push(".".to_owned());
@@ -272,14 +274,13 @@ where
     Ok((correct as f32) / (total as f32))
 }
 
-fn predict<I, O>(model: &AveragedPerceptron, input: &mut I, output: &mut O) -> Result<()>
+fn predict<I, O: Write>(model: &AveragedPerceptron, input: &mut I, output: &mut O) -> Result<()>
 where
-    I: Iterator<Item = std::io::Result<String>>,
-    O: Write,
+    I: Iterator<Item = serde_json::Result<Vec<String>>>,
 {
-    for piece_res in input {
-        let piece = piece_res?;
-        let sentence: Vec<String> = serde_json::from_str(piece.as_str())?;
+    let mut result = vec![];
+    for sentence_res in input {
+        let sentence = sentence_res?;
         let mut context = vec!["_START2".to_owned(), "_START1".to_owned()];
         context.extend(sentence.clone());
         context.push(".".to_owned());
@@ -306,8 +307,77 @@ where
                 .unwrap();
             predictions.push(prediction);
         }
-        serde_json::to_writer(&mut *output, &predictions)?;
-        output.write_all(b"\n")?;
+        result.push(predictions);
+    }
+    let serialized = serde_json::to_vec(&result)?;
+    output.write_all(&serialized)?;
+    Ok(())
+}
+
+fn read_frame_header(tcp_stream: &mut TcpStream) -> Result<Option<(u64, Verb)>> {
+    let mut length_tag = [0u8; 4];
+    match tcp_stream.read_exact(&mut length_tag) {
+        Ok(_) => {}
+        Err(error) => {
+            if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof) {
+                return Ok(None);
+            } else {
+                return Err(error.into());
+            }
+        }
+    };
+    let req_length = length_tag
+        .into_iter()
+        .fold(0i32, |acc, cur| (acc << 8) | (cur as i32));
+    if req_length < 0 {
+        return Ok(None);
+    }
+    let mut verb_tag = [0u8; 4];
+    tcp_stream.read_exact(&mut verb_tag)?;
+    let verb: Verb = verb_tag
+        .into_iter()
+        .fold(0i32, |acc, cur| (acc << 8) | (cur as i32))
+        .try_into()?;
+    Ok(Some((req_length as u64, verb)))
+}
+
+fn handle_conn(
+    tcp_stream: &mut TcpStream,
+    model_sync: Arc<Mutex<AveragedPerceptron>>,
+    model_location: String,
+) -> Result<()> {
+    let mut did_train = false;
+    while let Some((req_length, verb)) = read_frame_header(tcp_stream)? {
+        let limited = BufReader::new(tcp_stream.try_clone()?.take(req_length));
+        
+        match verb {
+            Verb::Train => {
+                let mut model = model_sync.lock().unwrap();
+                let mut lines = Deserializer::from_reader(limited).into_iter();
+                train(&mut model, &mut lines)?;
+                did_train = true;
+            }
+            Verb::Predict => {
+                let model = model_sync.lock().unwrap();
+                let mut lines = Deserializer::from_reader(limited).into_iter();
+                predict(&model, &mut lines, tcp_stream)?;
+            }
+        }
+    }
+    if did_train {
+        eprintln!("Trained; averaging weights...");
+        let mut model = model_sync.lock().unwrap();
+        model.data.retain(|_, rec| rec.observations >= 3);
+        model.data.shrink_to_fit();
+        model.average_weights();
+        eprintln!("Writing...");
+        let model_output = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(model_location)?;
+        let model_writer = BufWriter::new(model_output);
+        serde_json::to_writer(model_writer, &*model)?;
+        eprintln!("Done");
     }
     Ok(())
 }
@@ -319,11 +389,11 @@ fn main() -> Result<()> {
     }
     let port: u16 = args.get(1).unwrap().parse()?;
     let model_location = args.get(2).unwrap();
-    let mut model = match File::open(model_location) {
+    let model = match File::open(model_location) {
         Ok(file) => {
             eprintln!("Loading model...");
             serde_json::from_reader(BufReader::new(file))?
-        },
+        }
         Err(error) => {
             if matches!(error.kind(), std::io::ErrorKind::NotFound) {
                 eprintln!("Serialized model file not found");
@@ -333,60 +403,46 @@ fn main() -> Result<()> {
             }
         }
     };
-    
+
     let loopback = Ipv4Addr::new(127, 0, 0, 1);
-    let socket = SocketAddrV4::new(loopback, port);
-    let listener = TcpListener::bind(socket)?;
-    eprintln!("Ready");
-    loop {
-        let (mut tcp_stream, addr) = listener.accept()?; // block until requested
-        eprintln!("Connection accepted: {:?}", addr);
-        let mut did_train = false;
-        loop {
-            let mut length_tag = [0u8; 4];
-            if tcp_stream.read_exact(&mut length_tag).is_ok() {
-                let req_length = length_tag
-                    .into_iter()
-                    .fold(0i32, |acc, cur| (acc << 8) | (cur as i32));
-                println!("{}", req_length);
-                if req_length < 0 {
-                    break;
-                }
-                let mut verb_tag = [0u8; 4];
-                tcp_stream.read_exact(&mut verb_tag)?;
-                let verb: Verb = verb_tag
-                    .into_iter()
-                    .fold(0i32, |acc, cur| (acc << 8) | (cur as i32))
-                    .try_into()?;
+    let addr = SocketAddrV4::new(loopback, port);
+    let listener = TcpListener::bind(addr)?;
+    eprintln!("Server up");
+    
+    let n_workers = 10;
+    let model_sync = Arc::new(Mutex::new(model));
+    let (clients_push, clients_pull) = bounded(1);
+    let (handled_push, handled_pull) = bounded(1);
 
-                let limited = tcp_stream.try_clone()?.take(req_length as u64);
-                let mut lines = BufReader::new(limited).lines();
+    let r = crossbeam::scope(|s| {
+        s.spawn(|_| {
+            loop {
+                let (tcp_stream, addr) = listener.accept().unwrap();
+                eprintln!("Connection accepted: {:?}", addr);
+                clients_push.send(tcp_stream).unwrap();
+            }
+        });
 
-                match verb {
-                    Verb::Train => {
-                        train(&mut model, &mut lines)?;
-                        did_train = true;
-                    }
-                    Verb::Predict => {
-                        predict(&model, &mut lines, &mut tcp_stream)?;
-                    }
-                }
-            } else {
-                break;
+        for _ in 0..n_workers {
+            for mut tcp_stream in clients_pull.clone().iter() {
+                let model_sync_ref = model_sync.clone();
+                let model_location_string = model_location.to_string();
+                let handled_push_ref = handled_push.clone();
+                s.spawn(move |_| {
+                    let res = handle_conn(&mut tcp_stream, model_sync_ref, model_location_string);
+                    handled_push_ref.send(res).unwrap();
+                });
             }
         }
-        eprintln!("Connection finished: {:?}", addr);
 
-        if did_train {
-            model.data.retain(|_, rec| rec.observations >= 3);
-            model.data.shrink_to_fit();
-            model.average_weights();
-            let model_output = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(model_location)?;
-            let model_writer = BufWriter::new(model_output);
-            serde_json::to_writer(model_writer, &model)?;
+        for msg in handled_pull.iter() {
+            if let Err(error) = msg {
+                eprintln!("{}", error)
+            }
         }
+    });
+    match r {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("{:?}", error).into())
     }
 }

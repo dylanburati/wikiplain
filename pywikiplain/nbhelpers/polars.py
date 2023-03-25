@@ -6,7 +6,7 @@ from ipywidgets import interact
 
 def pager(DF, size):
     num_pages = math.ceil(DF.shape[0] / size)
-    page_input = list(range(num_pages)) if num_pages < 1000 else (0, num_pages, 1)
+    page_input = list(range(num_pages)) if num_pages < 1000 else (0, num_pages - 1, 1)
     return interact(lambda page: DF.slice(page*size, size), page=page_input)
 
 def searcher(DF, columns, page_size):
