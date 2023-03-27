@@ -122,8 +122,8 @@ fn parse_comment_like(i: &str) -> IResult<&str, Token> {
     value(
         Token::Comment,
         alt((
-            preceded(tag("--"), take_until("-->")),
-            preceded(tag("[CDATA["), take_until("]]>")),
+            delimited(tag("--"), take_until("-->"), tag("-->")),
+            delimited(tag("[CDATA["), take_until("]]>"), tag("]]>")),
         )),
     )(i)
 }
@@ -188,6 +188,32 @@ struct WikiPageContext<'a> {
     verbose: bool,
 }
 
+pub fn is_syntax_override(name: &str) -> bool {
+    matches!(name, "nowiki" | "pre" | "code" | "math" | "chem")
+}
+
+pub fn is_void_element(name: &str) -> bool {
+    // https://developer.mozilla.org/en-US/docs/Glossary/Void_element
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "keygen"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
 impl<'a> WikiPageContext<'a> {
     fn new(verbose: bool) -> WikiPageContext<'a> {
         WikiPageContext {
@@ -198,38 +224,12 @@ impl<'a> WikiPageContext<'a> {
         }
     }
 
-    fn is_syntax_override(name: &str) -> bool {
-        matches!(name, "nowiki" | "pre" | "code" | "math" | "chem")
-    }
-
-    fn is_void_element(name: &str) -> bool {
-        // https://developer.mozilla.org/en-US/docs/Glossary/Void_element
-        matches!(
-            name,
-            "area"
-                | "base"
-                | "br"
-                | "col"
-                | "embed"
-                | "hr"
-                | "img"
-                | "input"
-                | "keygen"
-                | "link"
-                | "meta"
-                | "param"
-                | "source"
-                | "track"
-                | "wbr"
-        )
-    }
-
     fn update(&mut self, token: Token<'a>) {
         match (self.unclosed_syntax_overrides, token.clone()) {
             (_, Token::ElementStart(name, false)) => {
-                if Self::is_void_element(name.as_str()) {
+                if is_void_element(name.as_str()) {
                     return;
-                } else if Self::is_syntax_override(name.as_str()) {
+                } else if is_syntax_override(name.as_str()) {
                     self.unclosed_syntax_overrides += 1;
                 } else if name == "ref" {
                     self.unclosed_refs += 1;
@@ -239,7 +239,7 @@ impl<'a> WikiPageContext<'a> {
             (_, Token::ElementEnd(name)) => {
                 while let Some(t2) = self.unclosed.pop() {
                     if matches!(t2.clone(), Token::ElementStart(n2, false) if n2 == name) {
-                        if Self::is_syntax_override(name.as_str()) {
+                        if is_syntax_override(name.as_str()) {
                             self.unclosed_syntax_overrides -= 1;
                         } else if name == "ref" {
                             self.unclosed_refs -= 1;
