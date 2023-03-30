@@ -1,6 +1,6 @@
 use std::{
     cmp::{Eq, PartialEq},
-    fmt::{Debug, Display, Write},
+    fmt::{Debug, Display},
     iter::Peekable,
 };
 
@@ -30,22 +30,18 @@ pub enum Token<'a> {
     Content(&'a str),
 }
 
-fn quick_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\n', "\\n")
-}
-
 impl Display for Token<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Token::Comment => f.write_char('!'),
-            Token::TemplateStart => f.write_char('{'),
-            Token::TemplateEnd => f.write_char('}'),
-            Token::LinkStart => f.write_char('['),
-            Token::LinkEnd => f.write_char(']'),
-            Token::ElementStart(name, false) => f.write_fmt(format_args!("<{}", name)),
-            Token::ElementStart(name, true) => f.write_fmt(format_args!("<>{}", name)),
-            Token::ElementEnd(name) => f.write_fmt(format_args!(">{}", name)),
-            Token::Content(text) => f.write_fmt(format_args!(".{}", quick_escape(text))),
+            Token::Comment => f.write_str("<!-- -->"),
+            Token::TemplateStart => f.write_str("{{"),
+            Token::TemplateEnd => f.write_str("}}"),
+            Token::LinkStart => f.write_str("[["),
+            Token::LinkEnd => f.write_str("]]"),
+            Token::ElementStart(name, false) => f.write_fmt(format_args!("<{}>", name)),
+            Token::ElementStart(name, true) => f.write_fmt(format_args!("<{} />", name)),
+            Token::ElementEnd(name) => f.write_fmt(format_args!("</{}>", name)),
+            Token::Content(text) => f.write_str(text),
         }
     }
 }
