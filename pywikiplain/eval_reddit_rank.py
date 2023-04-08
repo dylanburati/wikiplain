@@ -160,7 +160,7 @@ Span = tuple[int, int]
 RENORMALIZATIONS = {"|": "-"}
 
 
-def try_urlsplit(url_str) -> Optional[SplitURL]:
+def try_urlsplit(url_str: str) -> Optional[SplitURL]:
     try:
         return urlsplit(url_str)
     except ValueError:

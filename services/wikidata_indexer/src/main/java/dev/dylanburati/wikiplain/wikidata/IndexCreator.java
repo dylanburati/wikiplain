@@ -4,7 +4,7 @@ import dev.dylanburati.io.Conduit;
 import dev.dylanburati.io.LineStream;
 import static dev.dylanburati.io.Pair.pair;
 
-import java.io.BufferedOutputStream;
+import java.io.BufferedWriter;
 import java.io.DataOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -24,6 +24,8 @@ import org.apache.commons.io.output.CloseShieldOutputStream;
 import com.jsoniter.JsonIterator;
 
 public class IndexCreator {
+  public static final int ENTITIES_PER_GROUP = 1000;
+
   private static final byte LF = (byte) 10;
   private static final byte COMMA = (byte) 44;
   private static final byte RIGHT_CURLY = (byte) 125;
@@ -54,8 +56,8 @@ public class IndexCreator {
               case "id":
                 String eid = iterator.readString();
                 char kind = eid.charAt(0);
-                long id = Long.parseLong(eid.substring(1));
-                entity.id = pair(kind, id);
+                long numId = Long.parseLong(eid.substring(1));
+                entity.id = pair(kind, numId);
                 break;
               case "sitelinks":
                 String key2 = iterator.readObject();
@@ -73,8 +75,11 @@ public class IndexCreator {
                     iterator.skip();
                   }
                 }
-                for (; key2 != null; key2 = iterator.readObject()) {
-                  iterator.skip();
+                if (key2 != null) {
+                  key2 = iterator.readObject();
+                  for (; key2 != null; key2 = iterator.readObject()) {
+                    iterator.skip();
+                  }
                 }
                 break;
               default:
@@ -86,16 +91,19 @@ public class IndexCreator {
         });
 
       Entity entity;
-      int ENTITIES_PER_GROUP = 1000;
+      System.err.format("       BYTES\t    ARTICLES\t  ENWIKI\n");
+      System.err.format("           0\t           0\t       0");
       try (
         FileOutputStream out = new FileOutputStream(outputFilename);
         FileOutputStream indexOut = new FileOutputStream(outputIndexFilename);
         DataOutputStream indexWriter = new DataOutputStream(indexOut);
         FileOutputStream indexEnOut = new FileOutputStream(outputIndexEnFilename);
-        Writer indexEnWriter = new OutputStreamWriter(new BufferedOutputStream(indexOut), StandardCharsets.UTF_8);
+        Writer indexEnWriter = new BufferedWriter(new OutputStreamWriter(indexEnOut, StandardCharsets.UTF_8));
       ) {
         boolean eof = false;
         long offset = 0;
+        int enwikiCount = 0;
+        int articleCount = 0;
         while (!eof) {
           try (OutputStream outDec = new GZIPOutputStream(CloseShieldOutputStream.wrap(out), 131072)) {
             for (int i = 0; i < ENTITIES_PER_GROUP; i++) {
@@ -107,15 +115,17 @@ public class IndexCreator {
               outDec.write(entity.data.array(), entity.data.position(), entity.data.limit());
               outDec.write('\n');
               if (entity.id != null) {
+                articleCount++;
                 indexWriter.writeLong(offset);
                 indexWriter.writeLong((((long) entity.id.first) << 56) | entity.id.second);
                 if (entity.enwikiTitle != null) {
+                  enwikiCount++;
                   indexEnWriter.write(String.format("%d\t%d\t%s\n", offset, i, entity.enwikiTitle));
                 }
               }
             }
           }
-          System.err.format("\r\u001b[K%d", in.getChannel().position());
+          System.err.format("\r\u001b[K%12d\t%12d\t%8d", in.getChannel().position(), articleCount, enwikiCount);
           offset = out.getChannel().position();
         }
       }
