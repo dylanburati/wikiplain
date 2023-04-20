@@ -14,8 +14,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -37,12 +35,8 @@ import dev.dylanburati.io.Pair;
 import static dev.dylanburati.io.Pair.pair;
 
 public class QueryRunner implements Closeable {
-  private static final int NUM_WORKERS = 512;
-
   private final List<Long> blockOffsets;
-  private final Map<Long, Integer> blockOffsetToIndexInWorker;
-  private final List<QueryWorker> workers;
-  private final List<Long> workerIndices;
+  private final String dataFilename;
   private final FileInputStream binIndexStream;
   private final ByteBuffer binIndex;
   private final int binTreeDepth;
@@ -52,6 +46,7 @@ public class QueryRunner implements Closeable {
   private ExecutorService executor;
 
   public QueryRunner(String dataFilename) throws IOException {
+    this.dataFilename = dataFilename;
     String indexFilename = dataFilename.substring(0, dataFilename.length() - 3) + ".index.bin";
     String enIndexFilename = dataFilename.substring(0, dataFilename.length() - 3) + "-en.index.txt";
     this.binIndexStream = new FileInputStream(indexFilename);
@@ -65,28 +60,6 @@ public class QueryRunner implements Closeable {
     }
     this.binTreeDepth = (int) this.binIndex.getLong();
     this.binIndex.mark();
-
-    this.workers = new ArrayList<>();
-    this.workerIndices = new ArrayList<>();
-    this.blockOffsetToIndexInWorker = new HashMap<>();
-    int nBlocks = this.blockOffsets.size() - 1;
-    int blocksPerWorker = nBlocks / NUM_WORKERS;
-    int remainderBlocks = nBlocks % NUM_WORKERS;
-    int crossover = NUM_WORKERS - remainderBlocks;
-    for (int block = 0; block < nBlocks; /* */) {
-      int nextBlock = block + blocksPerWorker;
-      if (this.workers.size() >= crossover) {
-        nextBlock++;
-      }
-      this.workerIndices.add((long) block * IndexCreator.ENTITIES_PER_GROUP);
-      this.workers.add(new QueryWorker(dataFilename, this.blockOffsets.get(block), this.blockOffsets.get(nextBlock)));
-      for (int i = block; i < nextBlock; i++) {
-        this.blockOffsetToIndexInWorker.put(this.blockOffsets.get(i), i - block);
-      }
-      block = nextBlock;
-    }
-    this.workerIndices.add((long) nBlocks * IndexCreator.ENTITIES_PER_GROUP);
-
     this.enIndexStream = new FileInputStream(enIndexFilename);
     this.executor = Executors.newFixedThreadPool(8);
     this.taskPool = new ExecutorCompletionService<>(this.executor);
@@ -121,9 +94,9 @@ public class QueryRunner implements Closeable {
     }
   }
 
-  private static String stringId(long id) {
-    return "" + (char) (id >> 56) + (id & (0x00FF_FFFF_FFFF_FFFFL));
-  }
+  // private static String stringId(long id) {
+  //   return "" + (char) (id >> 56) + (id & (0x00FF_FFFF_FFFF_FFFFL));
+  // }
 
   public List<String> getEntities(Collection<String> ids) throws IOException, InterruptedException, ExecutionException {
     if (ids.isEmpty()) {
@@ -151,7 +124,7 @@ public class QueryRunner implements Closeable {
       }
       if (curr.depth < this.binTreeDepth - 1) {
         int size = this.readBinIndexInternalNode(partitionPoints, pointers);
-        // System.out.format("%d %d =\n    %s\n    %s\n", curr.depth, curr.position,
+        // System.err.format("%d %d =\n    %s\n    %s\n", curr.depth, curr.position,
         //     partitionPoints.stream().map(QueryRunner::stringId).collect(Collectors.toList()),
         //     pointers);
         int left = curr.left;
@@ -165,20 +138,20 @@ public class QueryRunner implements Closeable {
             }
           }
           if (right > left) {
-            System.err.format("%d %d [%d, %s..%s] contains %d..%d\n",
-                curr.depth, curr.position, i,
-                i > 0 ? stringId(partitionPoints.get(i - 1)) : "",
-                stringId(partitionPoints.get(i)),
-                left, right - 1);
+            // System.err.format("%d %d [%d, %s..%s] contains %d..%d\n",
+            //     curr.depth, curr.position, i,
+            //     i > 0 ? stringId(partitionPoints.get(i - 1)) : "",
+            //     stringId(partitionPoints.get(i)),
+            //     left, right - 1);
             searchQueue.add(new IndexSearchShard(pointers.get(i), curr.depth + 1, left, right - 1));
           }
           left = right;
         }
         if (curr.right >= left) {
-          System.err.format("%d %d [%d, %s..] contains %d..%d\n",
-              curr.depth, curr.position, size - 1,
-              stringId(partitionPoints.get(size - 2)),
-              left, curr.right);
+          // System.err.format("%d %d [%d, %s..] contains %d..%d\n",
+          //     curr.depth, curr.position, size - 1,
+          //     stringId(partitionPoints.get(size - 2)),
+          //     left, curr.right);
           searchQueue.add(new IndexSearchShard(pointers.get(size - 1), curr.depth + 1, left, curr.right));
         }
       } else {
@@ -203,32 +176,19 @@ public class QueryRunner implements Closeable {
       return Collections.emptyList();
     }
     
-    Collections.sort(found, Comparator.comparingInt(p -> p.first));
-    List<Future<List<String>>> tasks = new ArrayList<>();
-    Iterator<QueryWorker> workerIter = this.workers.iterator();
-    Iterator<Pair<Integer, Integer>> foundIter = found.iterator();
-    Pair<Integer, Integer> row = foundIter.next();
-    boolean atEnd = false;
-    while (!atEnd && workerIter.hasNext()) {
-      QueryWorker currWorker = workerIter.next();
-      List<Integer> lineNumbers = new ArrayList<>();
-      long blockOffset = this.blockOffsets.get(row.first);
-      while (blockOffset < currWorker.endOffset) {
-        lineNumbers.add(this.blockOffsetToIndexInWorker.get(blockOffset) * IndexCreator.ENTITIES_PER_GROUP + row.second);
-        if (foundIter.hasNext()) {
-          row = foundIter.next();
-          blockOffset = this.blockOffsets.get(row.first);
-        } else {
-          atEnd = true;
-          break;
-        }
-      }
-      if (!lineNumbers.isEmpty()) {
-        tasks.add(this.taskPool.submit(() -> {
-          return currWorker.selectByLineNumber(lineNumbers);
-        }));
-      }
-    }
+    Map<Integer, List<Integer>> foundMap = found.stream().collect(
+      Collectors.groupingBy(p -> p.first, Collectors.mapping(p -> p.second, Collectors.toList()))
+    );
+    List<Future<List<String>>> tasks = foundMap.entrySet().stream()
+        .map(e -> this.taskPool.submit(() -> {
+          QueryWorker worker = new QueryWorker(
+            this.dataFilename,
+            this.blockOffsets.get(e.getKey()),
+            this.blockOffsets.get(e.getKey() + 1)
+          );
+          return worker.selectByLineNumber(e.getValue());
+        }))
+        .collect(Collectors.toList());
 
     System.err.format("[planned] workers=%d\n", tasks.size());
     List<String> result = new ArrayList<>();
@@ -252,11 +212,11 @@ public class QueryRunner implements Closeable {
       this.buffered = Optional.empty();
     }
 
-    private List<Pair<Long, Integer>> takeWhileOffsetLessThan(Set<String> titleSet, long maxOffset) throws IOException {
-      List<Pair<Long, Integer>> result = new ArrayList<>();
+    private List<Integer> takeWhileOffsetEquals(Set<String> titleSet, long offset) throws IOException {
+      List<Integer> result = new ArrayList<>();
       if (this.buffered.isPresent()) {
-        if (this.buffered.get().first < maxOffset) {
-          result.add(this.buffered.get());
+        if (this.buffered.get().first == offset) {
+          result.add(this.buffered.get().second);
           this.buffered = Optional.empty();
         } else {
           return result;
@@ -271,11 +231,11 @@ public class QueryRunner implements Closeable {
         if (titleSet.contains(parts[2])) {
           long blockOffset = Long.valueOf(parts[0]);
           int lineNumber = Integer.valueOf(parts[1]);
-          if (blockOffset >= maxOffset) {
+          if (blockOffset > offset) {
             this.buffered = Optional.of(pair(blockOffset, lineNumber));
             break;
           }
-          result.add(pair(blockOffset, lineNumber));
+          result.add(lineNumber);
         }
       }
       this.eof = (line == null);
@@ -295,17 +255,20 @@ public class QueryRunner implements Closeable {
       Reader r1 = new InputStreamReader(CloseShieldInputStream.wrap(this.enIndexStream), StandardCharsets.UTF_8);
       BufferedReader rdr = new BufferedReader(r1);
     ) {
-      Iterator<QueryWorker> workerIter = this.workers.iterator();
+      Iterator<Long> offsetIter = this.blockOffsets.iterator();
       EntityPositions entityPositions = new EntityPositions(rdr);
-      while (workerIter.hasNext()) {
-        QueryWorker currWorker = workerIter.next();
-        List<Integer> lineNumbers = entityPositions.takeWhileOffsetLessThan(titleSet, currWorker.endOffset)
-          .stream()
-          .map((pair) -> pair.second + this.blockOffsetToIndexInWorker.get(pair.first) * IndexCreator.ENTITIES_PER_GROUP)
-          .collect(Collectors.toList());
+      long startOffset = -1;
+      long endOffset = offsetIter.next();
+      while (offsetIter.hasNext()) {
+        startOffset = endOffset;
+        endOffset = offsetIter.next();
+        List<Integer> lineNumbers = entityPositions.takeWhileOffsetEquals(titleSet, startOffset);
         if (!lineNumbers.isEmpty()) {
+          long st = startOffset;
+          long en = endOffset;
           tasks.add(this.taskPool.submit(() -> {
-            return currWorker.selectByLineNumber(lineNumbers);
+            QueryWorker worker = new QueryWorker(this.dataFilename, st, en);
+            return worker.selectByLineNumber(lineNumbers);
           }));
         }
       }
@@ -327,8 +290,5 @@ public class QueryRunner implements Closeable {
     this.executor.shutdownNow();
     this.binIndexStream.close();
     this.enIndexStream.close();
-    for (QueryWorker worker : this.workers) {
-      worker.close();
-    }
   }
 }
