@@ -441,6 +441,21 @@ pub fn is_disambiguation_page(text: &str) -> Result<bool> {
     Ok(tmpl_iter.next().is_some())
 }
 
+pub fn get_first_infobox_title(text: &str) -> Result<Option<String>> {
+    let tokens = tokenize(text)?;
+    let mut tmpl_iter = TemplateIterator::new(tokens, |title| {
+        title.starts_with("Infobox ") || title.starts_with("infobox ")
+    });
+    while let Some(tmpl) = tmpl_iter.next() {
+        if tmpl_iter.open_tmpls.iter().all(|e| e.is_none()) {
+            let (title, _) = tmpl.split_once('|').unwrap_or((&tmpl, ""));
+            let title = title.get(8..).expect("(\"Infobox \" + c).get(8..) === Some(c)");
+            return Ok(Some(title.trim().to_string()))
+        }
+    }
+    Ok(None)
+}
+
 fn validate_name(name: &str) -> bool {
     match name {
         "categorytree" => true,

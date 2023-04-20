@@ -56,3 +56,6 @@ def get_cite_urls(text: str) -> list[str]:
 
 def is_diambiguation_page(text: str) -> bool:
     """Detect whether the Wikitext string has a disambiguation marker template."""
+
+def get_first_infobox_title(text: str) -> str | None:
+    """Get the title of the first infobox template in the Wikitext, or None if not found."""

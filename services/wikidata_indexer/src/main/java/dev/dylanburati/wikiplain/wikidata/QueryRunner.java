@@ -2,23 +2,26 @@ package dev.dylanburati.wikiplain.wikidata;
 
 import java.io.BufferedReader;
 import java.io.Closeable;
-import java.io.DataInputStream;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutionException;
@@ -40,8 +43,9 @@ public class QueryRunner implements Closeable {
   private final Map<Long, Integer> blockOffsetToIndexInWorker;
   private final List<QueryWorker> workers;
   private final List<Long> workerIndices;
-  private final long numEntities;
-  private final FileInputStream bIndexStream;
+  private final FileInputStream binIndexStream;
+  private final ByteBuffer binIndex;
+  private final int binTreeDepth;
   private final FileInputStream enIndexStream;
 
   private CompletionService<List<String>> taskPool;
@@ -50,19 +54,18 @@ public class QueryRunner implements Closeable {
   public QueryRunner(String dataFilename) throws IOException {
     String indexFilename = dataFilename.substring(0, dataFilename.length() - 3) + ".index.bin";
     String enIndexFilename = dataFilename.substring(0, dataFilename.length() - 3) + "-en.index.txt";
+    this.binIndexStream = new FileInputStream(indexFilename);
+    this.binIndex = this.binIndexStream.getChannel()
+        .map(FileChannel.MapMode.READ_ONLY, 0, this.binIndexStream.getChannel().size())
+        .order(ByteOrder.BIG_ENDIAN);
+    int numBlocks = (int) this.binIndex.getLong();
     this.blockOffsets = new ArrayList<>();
-    this.bIndexStream = new FileInputStream(indexFilename);
-    this.numEntities = bIndexStream.getChannel().size() / 16;
-    try (DataInputStream din = new DataInputStream(CloseShieldInputStream.wrap(this.bIndexStream))) {
-      for (int i = 0; i < this.numEntities; i += IndexCreator.ENTITIES_PER_GROUP) {
-        this.blockOffsets.add(din.readLong());
-        if (i + IndexCreator.ENTITIES_PER_GROUP < this.numEntities) {
-          din.skipNBytes(IndexCreator.ENTITIES_PER_GROUP * 16 - 8);
-        }
-      }
+    for (long i = 0; i < numBlocks; i++) {
+      this.blockOffsets.add(this.binIndex.getLong());
     }
-    this.blockOffsets.add(Files.size(Paths.get(dataFilename)));
-    
+    this.binTreeDepth = (int) this.binIndex.getLong();
+    this.binIndex.mark();
+
     this.workers = new ArrayList<>();
     this.workerIndices = new ArrayList<>();
     this.blockOffsetToIndexInWorker = new HashMap<>();
@@ -82,52 +85,152 @@ public class QueryRunner implements Closeable {
       }
       block = nextBlock;
     }
-    this.workerIndices.add(this.numEntities);
+    this.workerIndices.add((long) nBlocks * IndexCreator.ENTITIES_PER_GROUP);
 
     this.enIndexStream = new FileInputStream(enIndexFilename);
     this.executor = Executors.newFixedThreadPool(8);
     this.taskPool = new ExecutorCompletionService<>(this.executor);
   }
 
+  private int readBinIndexInternalNode(List<Long> outPartitionPoints, List<Long> outPointers) {
+    outPartitionPoints.clear();
+    outPointers.clear();
+    int size = (int) this.binIndex.getLong();
+    for (int i = 0; i < size - 1; i++) {
+      outPartitionPoints.add(this.binIndex.getLong());
+    }
+    for (int i = 0; i < size; i++) {
+      outPointers.add(this.binIndex.getLong());
+    }
+    return size;
+  }
+
+  private static class IndexSearchShard {
+    private final long position;
+    private final int depth;
+    /** Index in query list of the smallest key that can be found under the node at `position` */
+    private final int left;
+    /** Index in query list of the largest key that can be found under the node at `position` */
+    private final int right;
+
+    public IndexSearchShard(long position, int depth, int left, int right) {
+      this.position = position;
+      this.depth = depth;
+      this.left = left;
+      this.right = right;
+    }
+  }
+
+  private static String stringId(long id) {
+    return "" + (char) (id >> 56) + (id & (0x00FF_FFFF_FFFF_FFFFL));
+  }
+
   public List<String> getEntities(Collection<String> ids) throws IOException, InterruptedException, ExecutionException {
     if (ids.isEmpty()) {
       return Collections.emptyList();
     }
-    Set<Long> idSet = new HashSet<>();
+    double startTime = System.nanoTime() / 1e9;
+    List<Long> idList = new ArrayList<>();
     for (String eid : ids) {
       char kind = eid.charAt(0);
       long numId = Long.parseLong(eid.substring(1));
-      idSet.add((((long) kind) << 56) | numId);
+      idList.add((((long) kind) << 56) | numId);
     }
-    this.bIndexStream.getChannel().position(0);
-    List<Future<List<String>>> tasks = new ArrayList<>();
-    double startTime = System.nanoTime() / 1e9;
-    try (DataInputStream din = new DataInputStream(CloseShieldInputStream.wrap(this.bIndexStream))) {
-      Iterator<QueryWorker> workerIter = this.workers.iterator();
-      Iterator<Long> fenceIter = this.workerIndices.iterator();
-      fenceIter.next();
-      long index = 0;
-      while (workerIter.hasNext()) {
-        long fence = fenceIter.next();
-        QueryWorker currWorker = workerIter.next();
-        List<Integer> lineNumbers = new ArrayList<>();
-        for (int lineNumber = 0; index < fence; index++, lineNumber++) {
-          din.readLong();
-          long eid = din.readLong();
-          if (idSet.contains(eid)) {
-            lineNumbers.add(lineNumber);
+    Collections.sort(idList);
+    this.binIndex.reset();
+    Queue<IndexSearchShard> searchQueue = new ArrayDeque<>();
+    searchQueue.add(new IndexSearchShard(-1, 0, 0, idList.size() - 1));
+    List<Long> partitionPoints = new ArrayList<>();
+    List<Long> pointers = new ArrayList<>();
+    List<Pair<Integer, Integer>> found = new ArrayList<>();
+    while (!searchQueue.isEmpty()) {
+      IndexSearchShard curr = searchQueue.remove();
+      if (curr.position >= 0) {
+        // TODO Make 64-bit wrapper
+        this.binIndex.position((int) curr.position);
+      }
+      if (curr.depth < this.binTreeDepth - 1) {
+        int size = this.readBinIndexInternalNode(partitionPoints, pointers);
+        // System.out.format("%d %d =\n    %s\n    %s\n", curr.depth, curr.position,
+        //     partitionPoints.stream().map(QueryRunner::stringId).collect(Collectors.toList()),
+        //     pointers);
+        int left = curr.left;
+        for (int i = 0; i < size - 1; i++) {
+          int right = left;
+          while (right <= curr.right) {
+            if (idList.get(right) < partitionPoints.get(i)) {
+              right++;
+            } else {
+              break;
+            }
+          }
+          if (right > left) {
+            System.err.format("%d %d [%d, %s..%s] contains %d..%d\n",
+                curr.depth, curr.position, i,
+                i > 0 ? stringId(partitionPoints.get(i - 1)) : "",
+                stringId(partitionPoints.get(i)),
+                left, right - 1);
+            searchQueue.add(new IndexSearchShard(pointers.get(i), curr.depth + 1, left, right - 1));
+          }
+          left = right;
+        }
+        if (curr.right >= left) {
+          System.err.format("%d %d [%d, %s..] contains %d..%d\n",
+              curr.depth, curr.position, size - 1,
+              stringId(partitionPoints.get(size - 2)),
+              left, curr.right);
+          searchQueue.add(new IndexSearchShard(pointers.get(size - 1), curr.depth + 1, left, curr.right));
+        }
+      } else {
+        int mid = curr.left;
+        while (mid <= curr.right) {
+          long key = this.binIndex.getLong();
+          while (mid <= curr.right && key > idList.get(mid)) {
+            mid++;
+          }
+          if (mid > curr.right) {
+            break;
+          }
+          int group = this.binIndex.getInt();
+          int positionInGroup = this.binIndex.getInt();
+          if (key == idList.get(mid)) {
+            found.add(pair(group, positionInGroup));
           }
         }
-        if (!lineNumbers.isEmpty()) {
-          tasks.add(this.taskPool.submit(() -> {
-            return currWorker.selectByLineNumber(lineNumbers);
-          }));
+      }
+    }
+    if (found.isEmpty()) {
+      return Collections.emptyList();
+    }
+    
+    Collections.sort(found, Comparator.comparingInt(p -> p.first));
+    List<Future<List<String>>> tasks = new ArrayList<>();
+    Iterator<QueryWorker> workerIter = this.workers.iterator();
+    Iterator<Pair<Integer, Integer>> foundIter = found.iterator();
+    Pair<Integer, Integer> row = foundIter.next();
+    boolean atEnd = false;
+    while (!atEnd && workerIter.hasNext()) {
+      QueryWorker currWorker = workerIter.next();
+      List<Integer> lineNumbers = new ArrayList<>();
+      long blockOffset = this.blockOffsets.get(row.first);
+      while (blockOffset < currWorker.endOffset) {
+        lineNumbers.add(this.blockOffsetToIndexInWorker.get(blockOffset) * IndexCreator.ENTITIES_PER_GROUP + row.second);
+        if (foundIter.hasNext()) {
+          row = foundIter.next();
+          blockOffset = this.blockOffsets.get(row.first);
+        } else {
+          atEnd = true;
+          break;
         }
+      }
+      if (!lineNumbers.isEmpty()) {
+        tasks.add(this.taskPool.submit(() -> {
+          return currWorker.selectByLineNumber(lineNumbers);
+        }));
       }
     }
 
     System.err.format("[planned] workers=%d\n", tasks.size());
-    
     List<String> result = new ArrayList<>();
     for (int i = 0; i < tasks.size(); i++) {
       result.addAll(this.taskPool.take().get());
@@ -222,7 +325,7 @@ public class QueryRunner implements Closeable {
   @Override
   public void close() throws IOException {
     this.executor.shutdownNow();
-    this.bIndexStream.close();
+    this.binIndexStream.close();
     this.enIndexStream.close();
     for (QueryWorker worker : this.workers) {
       worker.close();

@@ -35,7 +35,7 @@ public class Pair<T1, T2> {
 
   @Override
   public int hashCode() {
-    return (first == null ? 0 : first.hashCode()) ^ (second == null ? 0 : second.hashCode());
+    return Objects.hash(first, second);
   }
 
   public String toString() {
