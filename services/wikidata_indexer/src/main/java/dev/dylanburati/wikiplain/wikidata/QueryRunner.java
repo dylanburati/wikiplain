@@ -156,7 +156,7 @@ public class QueryRunner implements Closeable {
         }
       } else {
         int mid = curr.left;
-        while (mid <= curr.right) {
+        while (mid <= curr.right && this.binIndex.hasRemaining()) {
           long key = this.binIndex.getLong();
           while (mid <= curr.right && key > idList.get(mid)) {
             mid++;
@@ -204,7 +204,7 @@ public class QueryRunner implements Closeable {
   private static class EntityPositions {
     private final BufferedReader reader;
     private boolean eof;
-    private Optional<Pair<Long, Integer>> buffered;
+    private Optional<Pair<Integer, Integer>> buffered;
 
     private EntityPositions(BufferedReader reader) {
       this.reader = reader;
@@ -212,10 +212,10 @@ public class QueryRunner implements Closeable {
       this.buffered = Optional.empty();
     }
 
-    private List<Integer> takeWhileOffsetEquals(Set<String> titleSet, long offset) throws IOException {
+    private List<Integer> takeWhileBlockEquals(Set<String> titleSet, int blockNum) throws IOException {
       List<Integer> result = new ArrayList<>();
       if (this.buffered.isPresent()) {
-        if (this.buffered.get().first == offset) {
+        if (this.buffered.get().first == blockNum) {
           result.add(this.buffered.get().second);
           this.buffered = Optional.empty();
         } else {
@@ -229,10 +229,10 @@ public class QueryRunner implements Closeable {
       while ((line = this.reader.readLine()) != null) {
         String[] parts = line.split("\t");
         if (titleSet.contains(parts[2])) {
-          long blockOffset = Long.valueOf(parts[0]);
+          int entryBlockNum = Integer.valueOf(parts[0]);
           int lineNumber = Integer.valueOf(parts[1]);
-          if (blockOffset > offset) {
-            this.buffered = Optional.of(pair(blockOffset, lineNumber));
+          if (entryBlockNum > blockNum) {
+            this.buffered = Optional.of(pair(entryBlockNum, lineNumber));
             break;
           }
           result.add(lineNumber);
@@ -255,19 +255,14 @@ public class QueryRunner implements Closeable {
       Reader r1 = new InputStreamReader(CloseShieldInputStream.wrap(this.enIndexStream), StandardCharsets.UTF_8);
       BufferedReader rdr = new BufferedReader(r1);
     ) {
-      Iterator<Long> offsetIter = this.blockOffsets.iterator();
       EntityPositions entityPositions = new EntityPositions(rdr);
-      long startOffset = -1;
-      long endOffset = offsetIter.next();
-      while (offsetIter.hasNext()) {
-        startOffset = endOffset;
-        endOffset = offsetIter.next();
-        List<Integer> lineNumbers = entityPositions.takeWhileOffsetEquals(titleSet, startOffset);
+      for (int blockNum = 0; blockNum < this.blockOffsets.size() - 1; blockNum++) {
+        long startOffset = this.blockOffsets.get(blockNum);
+        long endOffset = this.blockOffsets.get(blockNum + 1);
+        List<Integer> lineNumbers = entityPositions.takeWhileBlockEquals(titleSet, blockNum);
         if (!lineNumbers.isEmpty()) {
-          long st = startOffset;
-          long en = endOffset;
           tasks.add(this.taskPool.submit(() -> {
-            QueryWorker worker = new QueryWorker(this.dataFilename, st, en);
+            QueryWorker worker = new QueryWorker(this.dataFilename, startOffset, endOffset);
             return worker.selectByLineNumber(lineNumbers);
           }));
         }

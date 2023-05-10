@@ -217,7 +217,7 @@ public class IndexCreator {
                     i));
                 if (entity.enwikiTitle != null) {
                   enwikiCount++;
-                  indexEnWriter.write(String.format("%d\t%d\t%s\n", offset, i, entity.enwikiTitle));
+                  indexEnWriter.write(String.format("%d\t%d\t%s\n", offsets.size(), i, entity.enwikiTitle));
                 }
               }
             }
