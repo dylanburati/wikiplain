@@ -4,7 +4,6 @@
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry::*;
-use std::collections::{HashMap, LinkedList};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, TcpListener};
@@ -12,8 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam::channel::bounded;
 use error_chain::error_chain;
+use fnv::FnvHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::de::Deserializer;
+use smallvec::SmallVec;
 
 error_chain! {
     foreign_links {
@@ -88,20 +89,20 @@ struct FeatClassRecord {
 
 #[derive(Serialize, Deserialize)]
 struct FeatRecord {
-    classes: LinkedList<FeatClassRecord>,
+    classes: SmallVec<[FeatClassRecord; 2]>,
     observations: u64,
 }
 
 impl FeatRecord {
     fn new() -> FeatRecord {
         FeatRecord {
-            classes: LinkedList::new(),
+            classes: SmallVec::default(),
             observations: 1,
         }
     }
 
     fn append_feat_class_record(&mut self, record: FeatClassRecord) {
-        self.classes.push_back(record);
+        self.classes.push(record);
     }
 
     fn get_feat_class_record(&mut self, class_id: usize) -> Option<&mut FeatClassRecord> {
@@ -117,14 +118,14 @@ struct Prediction {
 
 #[derive(Serialize, Deserialize)]
 struct AveragedPerceptron {
-    data: HashMap<String, FeatRecord>,
+    data: FnvHashMap<String, FeatRecord>,
     iteration: u64,
 }
 
 impl AveragedPerceptron {
     fn new() -> AveragedPerceptron {
         AveragedPerceptron {
-            data: HashMap::new(),
+            data: FnvHashMap::default(),
             iteration: 0,
         }
     }
