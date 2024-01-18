@@ -41,18 +41,22 @@ public class QueryRunner implements Closeable {
   private ExecutorService executor;
 
   private class StringIntPairMap {
-    private String[] keys;
+    private static final int BUF_SIZE = 16 * 1024 * 1024;
+    private long[] keys;
+    private final List<ByteBuffer> keyStorage;
     private int[] values0;
     private int[] values1;
     private int size;
 
     private StringIntPairMap(String enIndexFilename) throws IOException {
+      this.keyStorage = new ArrayList<>();
+      this.keyStorage.add(ByteBuffer.allocate(BUF_SIZE));
       try (
           FileInputStream stream = new FileInputStream(enIndexFilename);
           BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8));
       ) {
         int cap = 65536;
-        this.keys = new String[cap];
+        this.keys = new long[cap];
         this.values0 = new int[cap];
         this.values1 = new int[cap];
         String line;
@@ -65,8 +69,10 @@ public class QueryRunner implements Closeable {
             cap = this.grow();
             System.err.format("%s: capacity = %d\n", this, cap);
           }
-          int h = insertionIndex(this.keys, parts[2]);
-          this.keys[h] = parts[2];
+          byte[] keyContent = parts[2].getBytes(StandardCharsets.UTF_8);
+          int h = insertionIndex(this.keys, keyContent);
+          long keyRef = this.storeKey(keyContent);
+          this.keys[h] = keyRef;
           this.values0[h] = entryBlockNum;
           this.values1[h] = lineNumber;
           this.size++;
@@ -74,11 +80,46 @@ public class QueryRunner implements Closeable {
       }  
     }
 
-    private static int insertionIndex(String[] keys, String toInsert) {
+    private long storeKey(byte[] keyContent) {
+      if (keyContent.length > 0xffff) {
+        throw new IllegalArgumentException("Key too long");
+      }
+      int which = this.keyStorage.size() - 1;
+      ByteBuffer store = this.keyStorage.get(which);
+      if (store.remaining() < keyContent.length) {
+        which += 1;
+        store = ByteBuffer.allocate(BUF_SIZE);
+        this.keyStorage.add(store);
+      }
+      int offset = store.position();
+      store.put(keyContent);
+      return ((long) which << 48) | ((long) keyContent.length << 32) | ((long) offset << 1) | 1;
+    }
+
+    private ByteBuffer keyBuffer(long keyRef) {
+      int which = (int) (keyRef >> 48);
+      int length = (int) ((keyRef >> 32) & 0xffff);
+      int offset = (int) ((keyRef >> 1) & 0x7fff_ffff);
+      return ByteBuffer.wrap(this.keyStorage.get(which).array(), offset, length);
+    }
+
+    private static int insertionIndex(long[] keys, byte[] keyContent) {
       // `&` op makes sure this is positive
-      int h = (toInsert.hashCode() & 0x7fff_ffff) % keys.length;
+      int h = ByteBuffer.wrap(keyContent).hashCode() & 0x7fff_ffff;
+      h %= keys.length;
       int distance = 1;
-      while (keys[h] != null) {
+      while (keys[h] > 0) {
+        h = (h + distance) % keys.length;
+        distance++;
+      }
+      return h;
+    }
+
+    private int reinsertionIndex(long[] keys, long keyRef) {
+      int h = this.keyBuffer(keyRef).hashCode() & 0x7fff_ffff;
+      h %= keys.length;
+      int distance = 1;
+      while (keys[h] > 0) {
         h = (h + distance) % keys.length;
         distance++;
       }
@@ -86,31 +127,42 @@ public class QueryRunner implements Closeable {
     }
 
     private int readIndex(String toRead) {
-      int h = (toRead.hashCode() & 0x7fff_ffff) % this.keys.length;
+      ByteBuffer toReadBuf = ByteBuffer.wrap(toRead.getBytes(StandardCharsets.UTF_8));
+      int h = toReadBuf.hashCode() & 0x7fff_ffff;
+      // System.err.format("hash(\"%s\") = %x -> %x\n", toRead, h, h % this.keys.length);
+      h %= this.keys.length;
       int idx = h;
       int distance = 1;
-      while (this.keys[idx] != null) {
-        if (this.keys[idx].equals(toRead)) {
+      while (this.keys[idx] > 0) {
+        ByteBuffer curr = this.keyBuffer(this.keys[idx]);
+        // curr.mark();
+        // byte[] dst = new byte[curr.remaining()];
+        // curr.get(dst);
+        // curr.reset();
+        // System.err.format("  [%x]: \"%s\"\n", idx, new String(dst));
+        if (toReadBuf.equals(curr)) {
+          // System.err.format("  return idx\n");
           return idx;
         }
         idx = (idx + distance) % this.keys.length;
         distance++;
       }
+      // System.err.format("  return -1\n");
       return -1;
     }
 
     private int grow() {
       int cap = this.keys.length * 2;
-      String[] nextKeys = new String[cap];
+      long[] nextKeys = new long[cap];
       int[] nextValues0 = new int[cap];
       int[] nextValues1 = new int[cap];
       for (int src = 0; src < this.keys.length; src++) {
-        if (this.keys[src] != null) {
-          int idx = insertionIndex(nextKeys, this.keys[src]);
+        if (this.keys[src] > 0) {
+          int idx = this.reinsertionIndex(nextKeys, this.keys[src]);
           nextKeys[idx] = this.keys[src];
           nextValues0[idx] = this.values0[src];
           nextValues1[idx] = this.values1[src];
-        } 
+        }
       }
 
       this.keys = nextKeys;
