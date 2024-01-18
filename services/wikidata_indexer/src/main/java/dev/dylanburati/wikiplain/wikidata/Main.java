@@ -1,30 +1,28 @@
 package dev.dylanburati.wikiplain.wikidata;
 
 import java.io.IOException;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
 
-import org.apache.commons.io.output.TeeWriter;
+import org.apache.commons.io.function.IOSupplier;
 
 import com.jsoniter.JsonIterator;
-import com.jsoniter.output.JsonStream;
 
-import dev.dylanburati.io.Conduit;
-import dev.dylanburati.io.LineStream;
-import dev.dylanburati.io.Pair;
-import dev.dylanburati.servers.AppServer;
-import dev.dylanburati.servers.Client;
-import dev.dylanburati.servers.TCPServer;
+import io.javalin.Javalin;
 import joptsimple.NonOptionArgumentSpec;
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
 import joptsimple.OptionSpec;
 
 public class Main {
+  private static <R> R expect(IOSupplier<R> supplier, String message) {
+    try {
+      return supplier.get();
+    } catch (IOException e) {
+      throw new RuntimeException(message, e);
+    }
+  }
 
   public static void main(String[] args) throws InterruptedException, ExecutionException {
     OptionParser parser = new OptionParser();
@@ -67,56 +65,46 @@ public class Main {
     } else if ("query".equals(verb)) {
       Integer port = opts.valueOf(tcpPortOpt);
       if (port == null) {
-        System.err.println("Error: IndexServer requires output filename");
+        System.err.println("Error: IndexServer requires TCP port");
         System.exit(1);
       }
 
-      try (
-        AppServer server = new TCPServer(port);
-        QueryRunner backend = new QueryRunner(inFilename);
-      ) {
-        server.setup();
-        System.err.println("[ready]");
-        boolean hasMore = true;
-        while (hasMore) {
-          Pair<Boolean, Client> acceptPair = server.accept();
-          hasMore = acceptPair.first;
-          Client client = acceptPair.second;
-          try (
-              client;
-              Writer netWriter = new OutputStreamWriter(client.out, StandardCharsets.UTF_8);
-              Writer writer = new TeeWriter(new OutputStreamWriter(System.out), netWriter)
-          ) {
-            Conduit<Query> requests = Conduit
-              .makeSource(new LineStream(client.in, 65536))
-              .map((bytes) -> bytes.length > 0 ? JsonIterator.deserialize(bytes, Query.class) : null);
-            Query request;
-            while ((request = requests.get()) != null) {
-              if (request.type != 0 && request.type != 1) {
-                writer.write(JsonStream.serialize(Map.of("error", "unknown request type")));
-                continue;
-              }
-              System.err.format("[start] querySize=%d\n", request.args.size());
-              
-              List<String> response;
-              if (request.type == 0) {
-                response = backend.getEntities(request.args);
-              } else {
-                response = backend.getEntitiesByTitle(request.args);
-              }
-              writer.write(JsonStream.serialize(response));
-              writer.write('\n');
-              writer.flush();
+      String baseInFilename = inFilename.endsWith(".zst") ? inFilename.substring(0, inFilename.length() - 4) : inFilename;
+      String indexFilename = baseInFilename + ".index.bin";
+      String enIndexFilename = baseInFilename + "-en.index.txt";
+      QueryRunner backend = expect(
+          () -> new QueryRunner(inFilename, indexFilename, enIndexFilename),
+          "could not initialize QueryRunner"
+      );
+
+      final Object backendLock = new Object();
+      Javalin app = Javalin.create();
+      app.ws("/", ws -> {
+        ws.onMessage(ctx -> {
+          Query request = JsonIterator.deserialize(ctx.message(), Query.class);
+          System.err.format("[start] querySize=%d\n", request.args.size());
+          synchronized(backendLock) {
+            if (request.type == 0) {
+              ctx.send(backend.getEntities(request.args).stream().collect(Collectors.joining("\n")));
+            } else if (request.type == 1) {
+              ctx.send(backend.getEntitiesByTitle(request.args).stream().collect(Collectors.joining("\n")));
+            } else {
+              ctx.send(Map.of("error", "unknown request type"));
             }
-          } catch (IOException | InterruptedException | ExecutionException e) {
-            System.err.println("Client error");
-            e.printStackTrace();
           }
-        }
-      } catch (IOException e) {
-        System.err.println("Server error");
-        e.printStackTrace();
-      }
+        });
+      });
+      Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        app.stop();
+      }));
+      app.events(event -> {
+        event.serverStopped(() -> {
+          synchronized (backendLock) {
+            backend.close();
+          }
+        });
+      });
+      app.start(port);
     } else {
       System.err.println("Usage: wikidata_indexer create -i <raw> -o <processed>\n" +
                          "   or                   query -i <processed> -tcp <port>");

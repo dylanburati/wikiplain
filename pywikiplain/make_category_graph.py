@@ -1,21 +1,28 @@
 from dataclasses import dataclass
-from functools import partial
+import gzip
 import itertools
 import math
 import operator
+import os
 import pickle
 import sys
+
+import httpx
 import pyarrow.parquet as pq
 from sqlalchemy import create_engine
+import sqlalchemy
 from sqlalchemy.sql import text as sqltext
 from tqdm import tqdm
+from iohelpers import ReadableIterator
+import wikiplain
+
 
 @dataclass
 class Context:
     enwiki_parquet_filename: str
     pqf_size: int
-    old_database_uri: str
-    new_database_uri: str
+    categorylinks_url: str
+    database_uri: str
     enwiki_dir: str
 
     @property
@@ -44,13 +51,9 @@ def get_category_id_map(ctx: Context, pqf: pq.ParquetFile) -> dict[str, int]:
     return result
 
 def create_table(ctx: Context, category_id_map: dict[str, int]) -> None:
-    """Transforms a Wikipedia `categorylinks` table into a graph of article IDs."""
-    engine_c = create_engine(ctx.old_database_uri)
-    engine_c.execution_options(yield_per=10000)
-    engine_cg = create_engine(ctx.new_database_uri)
-    with (engine_c.connect() as conn_c,
-          engine_cg.connect() as conn_cg
-    ):
+    """Transforms a Wikipedia `categorylinks` sql.gz dump into a graph of article IDs."""
+    engine_cg = create_engine(ctx.database_uri)
+    with engine_cg.connect() as conn_cg:
         cr_stmt = sqltext(
             """CREATE TABLE categorylinks (
                 cl_from INTEGER NOT NULL,
@@ -58,40 +61,59 @@ def create_table(ctx: Context, category_id_map: dict[str, int]) -> None:
                 cl_subcat BOOLEAN NOT NULL
             )"""
         )
-        ins_stmt = sqltext("INSERT INTO categorylinks (cl_from, cl_to, cl_subcat) VALUES (:cl_from, :cl_to, :cl_subcat)")
         conn_cg.execute(cr_stmt)
 
-        res = conn_c.execute(sqltext("SELECT cl_from, cl_to, cl_type FROM categorylinks"))
-        for partition in tqdm(iter(partial(res.fetchmany, 10000), [])):
-            records = []
-            for aid, cat, typ in partition:
-                if typ not in ("subcat", "page"):
-                    continue
-                cat = str(cat).replace('_', ' ')
-                try:
-                    rec = {
-                        "cl_from": aid,
-                        "cl_to": int(category_id_map[cat]),
-                        "cl_subcat": typ == "subcat"
-                    }
-                    records.append(rec)
-                except KeyError:
-                    print(f"KeyError {(aid, cat, typ)!r}")
-            if len(records) > 0:
-                with conn_cg.begin():
-                    conn_cg.execute(ins_stmt, records)
-        
+        with httpx.stream("GET", ctx.categorylinks_url) as response:
+            total = int(response.headers["Content-Length"])
+            stream = ReadableIterator(response.iter_bytes())
+            fp = gzip.open(stream, "rb")
+            with tqdm(total=total, unit_scale=True, unit_divisor=1024, unit="B") as progress:
+                stream_into_table(fp, category_id_map, conn_cg, progress, response)
         conn_cg.execute(sqltext("CREATE INDEX idx_categorylinks_cl_from ON categorylinks (cl_from)"))
         conn_cg.execute(sqltext("CREATE INDEX idx_categorylinks_cl_to ON categorylinks (cl_to)"))
+
+def stream_into_table(fp: gzip.GzipFile, category_id_map: dict[str, int], conn: sqlalchemy.Connection, progress: tqdm, response: httpx.Response):
+    ins_stmt = sqltext("INSERT INTO categorylinks (cl_from, cl_to, cl_subcat) VALUES (:cl_from, :cl_to, :cl_subcat)")
+    num_bytes_downloaded = response.num_bytes_downloaded
+    for line in fp:
+        progress.update(response.num_bytes_downloaded - num_bytes_downloaded)
+        num_bytes_downloaded = response.num_bytes_downloaded
+        records = []
+        try:
+            table_name, rows = wikiplain.parse_sql_insert_statement(line)
+        except ValueError:
+            continue
+        if table_name != "categorylinks":
+            continue
+        for r in rows:
+            assert len(r) == 7
+            # cl_from, cl_to, cl_sortkey, cl_timestamp, cl_sortkey_prefix, cl_collation, cl_type
+            if isinstance(r[1], str) and (typ := r[6]) in ("page", "subcat"):
+                try:
+                    records.append({
+                        "cl_from": r[0],
+                        "cl_to": int(category_id_map[r[1]]),
+                        "cl_subcat": typ == "subcat"
+                    })
+                except KeyError:
+                    print(f"KeyError {r!r}")
+        if len(records) > 0:
+            with conn.begin():
+                conn.execute(ins_stmt, records)
+
 
 if __name__ == "__main__":
     ctx = Context(
         enwiki_parquet_filename=sys.argv[1],
         pqf_size=int(sys.argv[2]),
-        old_database_uri=sys.argv[3],
-        new_database_uri=sys.argv[4],
+        categorylinks_url=sys.argv[3],
+        database_uri=sys.argv[4],
         enwiki_dir=sys.argv[5]
     )
+    try:
+        os.mkdir(f"{ctx.enwiki_dir}/categories")
+    except FileExistsError:
+        pass
     pqf = pq.ParquetFile(ctx.enwiki_parquet_filename)
     category_id_map = get_category_id_map(ctx, pqf)
     with open(ctx.category_id_map_filename, "wb") as fp:

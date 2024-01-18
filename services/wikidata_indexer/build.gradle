@@ -18,6 +18,9 @@ dependencies {
     implementation group: 'com.jsoniter', name: 'jsoniter', version: '0.9.19'
     implementation group: 'org.javassist', name: 'javassist', version: '3.23.1-GA'
     implementation group: 'net.sf.jopt-simple', name: 'jopt-simple', version: '5.0.4'
+    implementation group: 'io.javalin', name: 'javalin', version: '5.6.3'
+    implementation group: 'org.slf4j', name: 'slf4j-simple', version: '2.0.7'
+    implementation group: 'com.github.luben', name: 'zstd-jni', version: '1.5.5-11'
     testImplementation group: 'junit', name: 'junit', version: '4.12'
 }
 

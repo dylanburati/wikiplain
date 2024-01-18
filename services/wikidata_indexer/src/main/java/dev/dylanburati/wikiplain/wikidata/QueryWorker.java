@@ -1,6 +1,5 @@
 package dev.dylanburati.wikiplain.wikidata;
 
-import java.io.BufferedInputStream;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -9,8 +8,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-import java.util.zip.GZIPInputStream;
 
+import com.github.luben.zstd.ZstdInputStream;
 import org.apache.commons.io.input.BoundedInputStream;
 import org.apache.commons.io.input.CloseShieldInputStream;
 
@@ -41,7 +40,7 @@ public class QueryWorker {
       in0.getChannel().position(this.startOffset);
       try (
           InputStream in1 = new BoundedInputStream(CloseShieldInputStream.wrap(in0), this.endOffset - this.startOffset);
-          InputStream inDec = new GZIPInputStream(new BufferedInputStream(in1, 32678));
+          InputStream inDec = new ZstdInputStream(in1);
       ) {
         Conduit<byte[]> reader = Conduit.makeSource(new LineStream(inDec, 32678)); 
         byte[] lineBytes;
