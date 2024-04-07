@@ -441,6 +441,18 @@ pub fn is_disambiguation_page(text: &str) -> Result<bool> {
     Ok(tmpl_iter.next().is_some())
 }
 
+pub fn get_distinguish_hatnotes(text: &str) -> Result<Vec<String>> {
+    let tokens = tokenize(text)?;
+    let mut tmpl_iter = TemplateIterator::new(tokens, is_distinguish_hatnote);
+    let mut result = vec![];
+    while let Some(tmpl) = tmpl_iter.next() {
+        if tmpl_iter.open_tmpls.iter().all(|e| e.is_none()) {
+            result.push(tmpl);
+        }
+    }
+    Ok(result)
+}
+
 pub fn get_first_infobox_title(text: &str) -> Result<Option<String>> {
     let tokens = tokenize(text)?;
     let mut tmpl_iter = TemplateIterator::new(tokens, |title| {
@@ -639,6 +651,41 @@ fn parse_tmpl_title(i: &str) -> IResult<&str, String> {
         }
     }
     Ok((rest, title_s))
+}
+
+fn is_distinguish_hatnote(title: &str) -> bool {
+    if let Ok((_, title_u1)) = parse_tmpl_title(title) {
+        matches!(
+            title_u1.as_str(),
+            "Hatnote"
+                | "For"
+                | "For-text"
+                | "For-multi"
+                | "About"
+                | "Other uses"
+                | "Other uses of"
+                | "Redirect-distinguish-for"
+                | "About-distinguish"
+                | "About-distinguish-text"
+                | "Other people"
+                | "About other people"
+                | "Similar names"
+                | "Other storms"
+                | "Other places"
+                | "Other ships"
+                | "Redirect"
+                | "Redirect2"
+                | "Redirect-multi"
+                | "Redirect-several"
+                | "Redirect-synonym"
+                | "Redirect-distinguish"
+                | "Redirect-distinguish-text"
+                | "Technical reasons"
+                | "Distinguish"
+        )
+    } else {
+        false
+    }
 }
 
 fn is_disambiguation_tmpl(title: &str) -> bool {

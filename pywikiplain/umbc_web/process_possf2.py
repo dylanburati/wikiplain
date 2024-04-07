@@ -1,10 +1,12 @@
 import glob
+import io
 import json
 import sys
 from concurrent.futures import as_completed, ProcessPoolExecutor
 import traceback
 from typing import Iterator
 
+from zstandard import ZstdCompressor
 from tqdm import tqdm
 
 
@@ -85,19 +87,22 @@ def process(in_filename: str, out_filename: str) -> None:
     """
     with open(in_filename, "r", encoding="utf-8") as fp:
         text = fp.read()
-    with open(out_filename, "w", encoding="utf-8") as fp:
-        for para in text.split("\n\n"):
-            acc: list[tuple[str, int]] = []
-            for word, tag in preprocess(para):
-                if tag == ".":
+    cctx = ZstdCompressor()
+    with open(out_filename, "wb") as fp_raw:
+        with cctx.stream_writer(fp_raw) as fp_enc:
+            fp = io.TextIOWrapper(fp_enc, encoding="utf-8", write_through=True)
+            for para in text.split("\n\n"):
+                acc: list[tuple[str, int]] = []
+                for word, tag in preprocess(para):
+                    if tag == ".":
+                        json.dump(acc, fp, separators=(',', ':'))
+                        fp.write('\n')
+                        acc = []
+                    else:
+                        acc.append((word.lower(), PENN_TAGS[tag]))
+                if len(acc) > 0:
                     json.dump(acc, fp, separators=(',', ':'))
                     fp.write('\n')
-                    acc = []
-                else:
-                    acc.append((word.lower(), PENN_TAGS[tag]))
-            if len(acc) > 0:
-                json.dump(acc, fp, separators=(',', ':'))
-                fp.write('\n')
 
 
 def try_process(in_filename: str, out_filename: str) -> None:
@@ -112,7 +117,7 @@ if __name__ == "__main__":
     in_filenames = glob.glob(sys.argv[1].rstrip("/") + "/*.possf2")
     with ProcessPoolExecutor(max_workers=10) as executor:
         futures = [
-            executor.submit(process, fname, fname.replace(".possf2", ".ldjson"))
+            executor.submit(process, fname, fname.replace(".possf2", ".zst"))
             for fname in in_filenames
         ]
         with tqdm(total=len(futures)) as progress:

@@ -1,6 +1,6 @@
 use std::{
-    cmp::{Eq, Ord, Ordering::*, PartialEq},
-    fmt::{Debug, Display},
+    cmp::{Ord, Ordering::*},
+    fmt::Display,
     fs::File,
     io,
     io::{BufRead, BufReader, Seek},
@@ -16,10 +16,12 @@ use arrow::{
 };
 use bzip2::read::*;
 use crossbeam::channel::{bounded, Receiver, Sender};
+use nom_sql::parser::parse_query_bytes;
 use parquet::{
     arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties,
     schema::types::ColumnPath,
 };
+use pyo3::{IntoPy, PyObject, types::PyBytes};
 use quick_xml::events::{BytesStart, BytesText, Event};
 
 use crate::{ErrorKind, Result, ResultExt};
@@ -318,7 +320,7 @@ fn arrow_arrays(pages: Vec<WikiPage>) -> [(&'static str, Arc<dyn Array>, bool); 
 
 type ChannelPair<T> = (Sender<T>, Receiver<T>);
 
-pub fn load(dump_path: &str, output_path: &str) -> Result<()> {
+pub fn load_pages_articles(dump_path: &str, output_path: &str) -> Result<()> {
     let mut index_path = PathBuf::from(dump_path);
     let dump_fname = index_path
         .file_name()
@@ -427,4 +429,41 @@ pub fn load(dump_path: &str, output_path: &str) -> Result<()> {
     .unwrap();
 
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct SqlLiteral(nom_sql::Literal);
+
+impl IntoPy<PyObject> for SqlLiteral {
+    fn into_py(self, py: pyo3::Python<'_>) -> PyObject {
+        match self.0 {
+            nom_sql::Literal::Null => py.None(),
+            nom_sql::Literal::Integer(i) => i.into_py(py),
+            nom_sql::Literal::UnsignedInteger(i) => i.into_py(py),
+            nom_sql::Literal::FixedPoint(x) => {
+                let v = f64::from(x.integral);
+                let v = if x.fractional == 0 { v } else { v + f64::from(x.fractional) / 10.0 / f64::powi(10.0, i32::try_from(x.fractional.ilog10()).unwrap()) };
+                v.into_py(py)
+            },
+            nom_sql::Literal::String(s) => s.into_py(py),
+            nom_sql::Literal::Blob(b) => PyBytes::new(py, &b).into_py(py),
+            nom_sql::Literal::CurrentTime => py.None(),
+            nom_sql::Literal::CurrentDate => py.None(),
+            nom_sql::Literal::CurrentTimestamp => py.None(),
+            nom_sql::Literal::Placeholder => py.None(), 
+        }
+    }
+}
+
+pub fn parse_sql_insert_statement(text: &[u8]) -> Result<(String, Vec<Vec<SqlLiteral>>)> {
+    let query = parse_query_bytes(text).map_err(|m| ErrorKind::SQLParseError(m))?;
+    match query {
+        nom_sql::SqlQuery::Insert(statement) => {
+            let data = statement.data.into_iter().map(|tpl| tpl.into_iter().map(SqlLiteral).collect()).collect();
+            Ok((statement.table.to_string(), data))
+        }
+        _ => {
+            Err(ErrorKind::InvalidArgument("not an insert statement".into()).into()) 
+        }    
+    }
 }

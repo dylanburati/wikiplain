@@ -1,8 +1,6 @@
-import io
-import itertools
 import json
 import os
-import pickle
+from pathlib import Path
 import socket
 import struct
 import sys
@@ -11,14 +9,14 @@ import time
 import traceback
 from collections import defaultdict, deque
 from concurrent.futures import as_completed, ProcessPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time as timeofday, timedelta
-from types import TracebackType
-from typing import IO, Type, Iterator, Iterable, Optional, List, TypedDict, TypeVar
+from datetime import datetime, timedelta
+from typing import Any, Iterator, Optional, TypedDict, cast
 from urllib.parse import urlsplit, SplitResult as SplitURL
 from xml.sax.saxutils import unescape as xml_unescape
 
-import httpx
+import cbor2
 import ijson
 import numpy as np
 import sqlalchemy as sa
@@ -29,131 +27,6 @@ from tqdm import tqdm
 from zstandard import ZstdDecompressor
 
 from umbc_web.process_possf2 import PENN_TAGS
-
-
-T1 = TypeVar("T1")
-T2 = TypeVar("T2")
-
-
-def lazy_product(iterable1: Iterable[T1], iterable2: Iterable[T2]) -> Iterator[tuple[T1, T2]]:
-    """Version of itertools.product that doesn't fully load the iterators."""
-    iter2 = iter(iterable2)
-    for elem1 in iterable1:
-        iter2, iter2_copy = itertools.tee(iter2)
-        for elem2 in iter2_copy:
-            yield (elem1, elem2)
-
-
-class ReadableIterator(IO[bytes]):
-    """File-like wrapper for an iterator that yields bytes."""
-
-    __inner: Optional[Iterator[bytes]]
-    __position: int
-    __buffered: bytes
-
-    def __init__(self, inner: Iterator[bytes]):
-        self.__inner = inner
-        self.__position = 0
-        self.__buffered = b""
-
-    def __enter__(self) -> IO[bytes]:
-        return self
-
-    def __exit__(
-        self,
-        __t: Optional[Type[BaseException]],
-        __value: Optional[BaseException],
-        __traceback: Optional[TracebackType],
-    ) -> None:
-        self.close()
-
-    def close(self) -> None:
-        """
-        Close the IO object.
-
-        Attempting any further operation after the object is closed will raise an OSError. This method has no
-        effect if the file is already closed.
-        """
-        self.__inner = None
-
-    def fileno(self) -> int:
-        """
-        Returns the underlying file descriptor (an integer).
-        """
-        return -1
-
-    def readable(self) -> bool:
-        """
-        Returns True if the IO object can be read.
-        """
-        return True
-
-    def __require_inner(self) -> Iterator[bytes]:
-        if self.__inner is None:
-            raise OSError("Can't read a closed file")
-        return self.__inner
-
-    def read(self, size: int = -1) -> bytes:
-        """
-        Read at most size bytes, returned as a bytes object.
-
-        If the size argument is negative, read until EOF is reached.
-        Return an empty bytes object at EOF.
-        """
-        if size == 0:
-            return b""
-        result = self.__buffered
-        while size < 0 or len(result) < size:
-            try:
-                result += next(self.__require_inner())
-            except StopIteration:
-                break
-        if size > 0:
-            self.__buffered = result[size:]
-            self.__position += size
-            return result[:size]
-        self.__buffered = b""
-        self.__position += len(result)
-        return result
-
-    def readline(self, __limit: int = -1) -> bytes:
-        raise ValueError("Line-based methods are not available on ReadableIterator")
-
-    def readlines(self, __hint: int = -1) -> List[bytes]:
-        raise ValueError("Line-based methods are not available on ReadableIterator")
-
-    def seekable(self) -> bool:
-        return False
-
-    def seek(self, __offset: int, __whence: int = io.SEEK_CUR) -> int:
-        raise ValueError("Cannot seek")
-
-    def tell(self) -> int:
-        return self.__position
-
-    def writable(self) -> bool:
-        return False
-
-    def flush(self) -> None:
-        raise ValueError("Cannot write")
-
-    def truncate(self, __size: Optional[int] = None) -> int:
-        raise ValueError("Cannot write")
-
-    def write(self, __s: bytes) -> int:
-        raise ValueError("Cannot write")
-
-    def writelines(self, __lines: Iterable[bytes]) -> None:
-        raise ValueError("Cannot write")
-
-    def isatty(self) -> bool:
-        return False
-
-    def __next__(self) -> bytes:
-        raise ValueError("Iterable methods are not available on ReadableIterator")
-
-    def __iter__(self) -> Iterator[bytes]:
-        raise ValueError("Iterable methods are not available on ReadableIterator")
 
 
 Span = tuple[int, int]
@@ -168,22 +41,21 @@ def try_urlsplit(url_str: str) -> Optional[SplitURL]:
 
 
 def submission_titles(
-    pushshift_url: str, top_cite_domain_set: set[str]
+    pushshift_path: str, top_cite_domain_set: set[str]
 ) -> Iterator[list[str]]:
     """Yields tokenized titles of Reddit submissions in the Pushshift archive set.
 
     Only submissions whose URL is one of the given domains are considered.
     """
     nlp = English()
-    task_id = pushshift_url.split("/")[-1]
+    task_id = Path(pushshift_path).stem
     with (
-        httpx.stream("GET", pushshift_url) as response,
+        open(pushshift_path, "rb") as fp,
         tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", suffix=task_id + ".progress"
         ) as prog_file,
     ):
-        total_s = response.headers.get("content-length")
-        fp = ReadableIterator(response.iter_bytes())
+        total_s = os.stat(fp.fileno()).st_size
         # redirect progress bar to a BytesIO and manually write progress
         dctx = ZstdDecompressor(max_window_size=2 * 1024 * 1024 * 1024)
         reader = dctx.stream_reader(fp)
@@ -236,10 +108,47 @@ class Context:
     database_uri: str
     pos_tagger_port: int
     enwiki_dir: str
+    reddit_dir: str
 
     @property
     def top_cite_domains_filename(self) -> str:
-        return f"{self.enwiki_dir}/pagerank/top_cite_domains.pkl"
+        return f"{self.enwiki_dir}/pagerank/top_cite_domains.bin"
+
+
+class TagResult(TypedDict):
+    """Part-of-speech tagging result."""
+
+    scores: list[float]
+    observations: int
+
+
+class PartOfSpeechTagger:
+    rfile: socket.SocketIO
+    wfile: socket.SocketIO
+    reader: Iterator[Any]
+
+    def __init__(self, sock: socket.socket, port: int):
+        sock.connect(("127.0.0.1", port))
+        self.rfile = sock.makefile("rb", buffering=0)
+        self.wfile = sock.makefile("wb", buffering=0)
+        self.reader = ijson.items(self.rfile, "", use_float=True, multiple_values=True)
+
+    def tag_sentences(self, sentences: list[list[str]]) -> list[list[TagResult]]:
+        sentences_b = [json.dumps(e).encode("utf-8") + b"\n" for e in sentences]
+        req = b"".join(sentences_b)
+        self.wfile.write(struct.pack(">2I", len(req), 0) + req)
+        return cast(list[list[TagResult]], next(self.reader))
+
+
+@contextmanager
+def new_pos_querier(port: int) -> Iterator[PartOfSpeechTagger]:
+    with socket.socket() as sock:
+        resource = PartOfSpeechTagger(sock, port)
+        try:
+            yield resource
+        finally:
+            resource.rfile.close()
+            resource.wfile.close()
 
 
 def load_max_span_map(conn: sa.Connection) -> dict[str, int]:
@@ -248,13 +157,6 @@ def load_max_span_map(conn: sa.Connection) -> dict[str, int]:
     for k, v in conn.execute(sqltext("SELECT k, v FROM max_span_map")):
         result[k] = v
     return result
-
-
-class TagResult(TypedDict):
-    """Part-of-speech tagging result."""
-
-    scores: list[float]
-    observations: int
 
 
 def add_queries(
@@ -294,7 +196,7 @@ def add_queries(
 
 
 def compute_relevance(
-    context: Context, pushshift_url: str, output_filename: str
+    context: Context, pushshift_path: str, output_filename: str
 ) -> None:
     relevance = np.zeros(context.num_articles, dtype=np.float64)
     engine = sa.create_engine(context.database_uri)
@@ -306,7 +208,7 @@ def compute_relevance(
         sa.Column("weight", sa.Float),
     )
     with open(context.top_cite_domains_filename, "rb") as fp:
-        top_cite_domains = pickle.load(fp)
+        top_cite_domains = cbor2.load(fp)
         excluded_domains = {
             "imgur.com",
             "twitter.com",
@@ -321,28 +223,21 @@ def compute_relevance(
         top_cite_domain_set = {domain for domain, _ in top_cite_domains}
         top_cite_domain_set -= excluded_domains
 
-    with engine.connect() as conn, socket.socket() as sock:
+    with engine.connect() as conn, new_pos_querier(context.pos_tagger_port) as pos_tagger:
         max_span_map = load_max_span_map(conn)
-        sock.connect(("127.0.0.1", context.pos_tagger_port))
-        rfile = sock.makefile("rb", buffering=0)
-        wfile = sock.makefile("wb", buffering=0)
-        reader = ijson.items(rfile, "", use_float=True, multiple_values=True)
         for group in itertoolz.partition_all(
-            50, submission_titles(pushshift_url, top_cite_domain_set)
+            50, submission_titles(pushshift_path, top_cite_domain_set)
         ):
-            sentences = [json.dumps(e).encode("utf-8") + b"\n" for e in group]
-            req = b"".join(sentences)
-            wfile.write(struct.pack(">2I", len(req), 0) + req)
-            resp: list[list[TagResult]] = next(reader)
-            # Each element refers to a span in context; (prob of being a noun-phrase, children)
+            tag_resp = pos_tagger.tag_sentences(group)
+            # queries: Each element refers to a span in context; (prob of being a noun-phrase, children)
             #   - prob of being a noun-phrase is a simple average of P(max(token is NNP, token is NNPS))
             #     for the tokens in the query. Anything less than 0.01 is excluded
             #   - children is a list of indices pointing to the `length-1` subspans of this query,
             #     if this query's length is >1 and those subspans are actually queries
             queries: list[tuple[float, list[int]]] = []
-            # Text of query -> indices in query list
+            # query_rev: Text of query -> indices in query list
             query_rev: defaultdict[str, list[int]] = defaultdict(list)
-            for sentence, taginfo in zip(group, resp):
+            for sentence, taginfo in zip(group, tag_resp):
                 spans = compute_spans(sentence, max_span_map)
                 add_queries(sentence, spans, taginfo, queries, query_rev)
 
@@ -372,7 +267,7 @@ def compute_relevance(
                         relevance[node_id] += weight * queries[qid][0]
 
     with open(output_filename, "wb") as fp:
-        pickle.dump(relevance, fp)
+        np.save(fp, relevance)
 
 
 if __name__ == "__main__":
@@ -380,25 +275,29 @@ if __name__ == "__main__":
         database_uri=sys.argv[1],
         num_articles=int(sys.argv[2]),
         pos_tagger_port=int(sys.argv[3]),
-        enwiki_dir=sys.argv[4]
+        enwiki_dir=sys.argv[4],
+        reddit_dir=sys.argv[5]
     )
-    urls: list[str] = []
-    filenames: list[str] = []
+    tasks: list[tuple[str, str]] = []
+    date_iterator = map(
+        lambda e: datetime(year=e[0], month=e[1], day=1, hour=0, second=0),
+        itertoolz.iterate(lambda e: (e[0] + e[1] // 12, 1 + e[1] % 12), (2015, 1))
+    )
     max_date = datetime.now() - timedelta(days=45)
-    for year, month in lazy_product(itertools.count(2015), range(1, 13)):
-        if datetime.combine(date(year, month, 1), timeofday.min) >= max_date:
+    for dt in date_iterator:
+        if dt >= max_date:
             break
-        month_s = str(month).zfill(2)
-        filename = f"{ctx.enwiki_dir}/pagerank/RS_{year}-{month_s}.pkl"
-        if not os.path.exists(filename):
-            urls.append(
-                f"https://files.pushshift.io/reddit/submissions/RS_{year}-{month_s}.zst"
-            )
-            filenames.append(filename)
+        ds = dt.isoformat()[:7]
+        result_filename = f"{ctx.enwiki_dir}/pagerank/RS_{ds}.npy"
+        if not os.path.exists(result_filename):
+            tasks.append((
+                f"{ctx.reddit_dir}/submissions/RS_{ds}.zst",
+                result_filename,
+            ))
     with ProcessPoolExecutor(max_workers=3) as executor:
         futures = [
-            executor.submit(compute_relevance, ctx, url, fname)
-            for url, fname in zip(urls, filenames)
+            executor.submit(compute_relevance, ctx, pushshift, out_path)
+            for pushshift, out_path in tasks
         ]
         with tqdm(total=len(futures)) as progress:
             for f in as_completed(futures):

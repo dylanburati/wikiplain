@@ -1,5 +1,4 @@
 from enum import Enum
-from typing import Optional
 
 class TokenKind(Enum):
     Comment = ...
@@ -14,9 +13,9 @@ class TokenKind(Enum):
 
 class Token:
     kind: TokenKind
-    data: Optional[str]
+    data: str | None
 
-    def __init__(self, kind: TokenKind, data: Optional[str]): ...
+    def __init__(self, kind: TokenKind, data: str | None): ...
 
 class NodeKind(Enum):
     Document = ...
@@ -29,12 +28,12 @@ class NodeKind(Enum):
 class Node:
     kind: NodeKind
     children: list[Node]
-    data: Optional[str]
+    data: str | None
 
-    def __init__(self, kind: NodeKind, children: list[Node], data: Optional[str]): ...
+    def __init__(self, kind: NodeKind, children: list[Node], data: str | None): ...
 
 def load_bz2(dump_path: str, output_path: str) -> None:
-    """Load a Wikimedia XML dump to into a parquet file."""
+    """Load a Wikimedia XML dump into a parquet file."""
 
 def test_parser(text: str) -> int:
     """Test the Wikitext tokenizer."""
@@ -56,6 +55,11 @@ def get_cite_urls(text: str) -> list[str]:
 
 def is_diambiguation_page(text: str) -> bool:
     """Detect whether the Wikitext string has a disambiguation marker template."""
+
+def get_distinguish_hatnotes(text: str) -> list[str]:
+    """Get the full template content for the 'For other uses ...' or 'This page is about _, ...' notes
+    on the page.
+    """
 
 def get_first_infobox_title(text: str) -> str | None:
     """Get the title of the first infobox template in the Wikitext, or None if not found."""

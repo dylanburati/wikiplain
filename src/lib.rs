@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::ops::Deref;
 
 use error_chain::error_chain;
-use pyo3::{exceptions::PyValueError, prelude::*, PyRef};
+use pyo3::{exceptions::PyValueError, prelude::*, PyRef, wrap_pyfunction};
 
 mod dumps;
 mod wikitext;
@@ -27,6 +27,10 @@ error_chain! {
         InvalidIndexFile {
             description("invalid index file"),
         }
+        SQLParseError(m: &'static str) {
+            description("SQL parse error"),
+            display("SQL parse error: {}", m)
+        }
         WikitextParseError(m: String) {
             description("wikitext parse error"),
             display("wikitext parse error: {}", m)
@@ -42,12 +46,19 @@ error_chain! {
     }
 }
 
-/// Formats the sum of two numbers as string.
+/// Load a Wikimedia XML dump into a parquet file.
 #[pyfunction]
 fn load_bz2(dump_path: &str, output_path: &str) -> PyResult<()> {
-    dumps::load(dump_path, output_path).map_err(|err| PyValueError::new_err(err.to_string()))
+    dumps::load_pages_articles(dump_path, output_path).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+/// Parse a SQL insert statement and get the table name and list of rows to insert.
+#[pyfunction(name = "parse_insert_statement")]
+fn parse_sql_insert_statement(text: &[u8]) -> PyResult<(String, Vec<Vec<dumps::SqlLiteral>>)> {
+    dumps::parse_sql_insert_statement(text).map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+/// Test the Wikitext tokenizer.
 #[pyfunction]
 fn test_parser(text: &str) -> PyResult<usize> {
     let tokens = wikitext::tokenize(text).map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -138,6 +149,7 @@ impl<'a> TryFrom<&'a PyToken> for Token<'a> {
     }
 }
 
+/// Tokenize Wikitext.
 #[pyfunction]
 fn tokenize(text: &str) -> PyResult<Vec<PyToken>> {
     wikitext::tokenize(text)
@@ -238,6 +250,7 @@ impl From<Node> for PyNode {
     }
 }
 
+/// Build a syntax tree from tokenized Wikitext.
 #[pyfunction]
 fn parse_tokens(tokens: Vec<PyRef<PyToken>>) -> PyResult<PyNode> {
     let mut native_tokens = vec![];
@@ -249,6 +262,7 @@ fn parse_tokens(tokens: Vec<PyRef<PyToken>>) -> PyResult<PyNode> {
         .map(|doc| doc.into())
 }
 
+/// Tokenize Wikitext and build a syntax tree.
 #[pyfunction]
 fn parse(text: &str) -> PyResult<PyNode> {
     let tokens = wikitext::tokenize(text).map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -257,29 +271,47 @@ fn parse(text: &str) -> PyResult<PyNode> {
         .map(|doc| doc.into())
 }
 
+/// Extract the internal links from a Wikitext string.
 #[pyfunction]
 fn get_links(text: &str) -> PyResult<Vec<String>> {
     wikitext::get_links(text).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+/// Extract the URLs used in web citations from a Wikitext string.
 #[pyfunction]
 fn get_cite_urls(text: &str) -> PyResult<Vec<String>> {
     wikitext::get_cite_urls(text).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+/// Detect whether the Wikitext string has a disambiguation marker template.
 #[pyfunction]
 fn is_disambiguation_page(text: &str) -> PyResult<bool> {
     wikitext::is_disambiguation_page(text).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+/// Get the full template content for the "For other uses ..." or "This page is about _, ..." notes
+/// on the page.
+#[pyfunction]
+fn get_distinguish_hatnotes(text: &str) -> PyResult<Vec<String>> {
+    wikitext::get_distinguish_hatnotes(text).map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+/// Get the title of the first infobox template in the Wikitext, or None if not found.
 #[pyfunction]
 fn get_first_infobox_title(text: &str) -> PyResult<Option<String>> {
     wikitext::get_first_infobox_title(text).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+fn sql_module(py: Python, parent_module: &PyModule) -> PyResult<()> {
+    let m = PyModule::new(py, "sql")?;
+    m.add_function(wrap_pyfunction!(parse_sql_insert_statement, m)?)?;
+    parent_module.add_submodule(m)?;
+    Ok(())
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
-fn wikiplain(_py: Python, m: &PyModule) -> PyResult<()> {
+fn wikiplain(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyTokenKind>()?;
     m.add_class::<PyToken>()?;
     m.add_class::<PyNodeKind>()?;
@@ -292,6 +324,8 @@ fn wikiplain(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_links, m)?)?;
     m.add_function(wrap_pyfunction!(get_cite_urls, m)?)?;
     m.add_function(wrap_pyfunction!(is_disambiguation_page, m)?)?;
+    m.add_function(wrap_pyfunction!(get_distinguish_hatnotes, m)?)?;
     m.add_function(wrap_pyfunction!(get_first_infobox_title, m)?)?;
+    sql_module(py, m)?;
     Ok(())
 }

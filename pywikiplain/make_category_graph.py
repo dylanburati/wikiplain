@@ -4,9 +4,9 @@ import itertools
 import math
 import operator
 import os
-import pickle
 import sys
 
+import cbor2
 import httpx
 import pyarrow.parquet as pq
 from sqlalchemy import create_engine
@@ -27,7 +27,7 @@ class Context:
 
     @property
     def category_id_map_filename(self):
-        return f"{self.enwiki_dir}/categories/category_id_map.pkl"
+        return f"{self.enwiki_dir}/categories/category_id_map.bin"
 
 CATEGORY_PREFIX = "Category:"
 
@@ -80,7 +80,7 @@ def stream_into_table(fp: gzip.GzipFile, category_id_map: dict[str, int], conn: 
         num_bytes_downloaded = response.num_bytes_downloaded
         records = []
         try:
-            table_name, rows = wikiplain.parse_sql_insert_statement(line)
+            table_name, rows = wikiplain.sql.parse_insert_statement(line)  # type: ignore
         except ValueError:
             continue
         if table_name != "categorylinks":
@@ -90,16 +90,17 @@ def stream_into_table(fp: gzip.GzipFile, category_id_map: dict[str, int], conn: 
             # cl_from, cl_to, cl_sortkey, cl_timestamp, cl_sortkey_prefix, cl_collation, cl_type
             if isinstance(r[1], str) and (typ := r[6]) in ("page", "subcat"):
                 try:
+                    k = r[1].replace("_", " ")
                     records.append({
                         "cl_from": r[0],
-                        "cl_to": int(category_id_map[r[1]]),
+                        "cl_to": int(category_id_map[k]),
                         "cl_subcat": typ == "subcat"
                     })
                 except KeyError:
                     print(f"KeyError {r!r}")
         if len(records) > 0:
-            with conn.begin():
-                conn.execute(ins_stmt, records)
+            conn.execute(ins_stmt, records)
+            conn.commit()
 
 
 if __name__ == "__main__":
@@ -114,8 +115,11 @@ if __name__ == "__main__":
         os.mkdir(f"{ctx.enwiki_dir}/categories")
     except FileExistsError:
         pass
-    pqf = pq.ParquetFile(ctx.enwiki_parquet_filename)
-    category_id_map = get_category_id_map(ctx, pqf)
-    with open(ctx.category_id_map_filename, "wb") as fp:
-        pickle.dump(category_id_map, fp)
+    # pqf = pq.ParquetFile(ctx.enwiki_parquet_filename)
+    # category_id_map = get_category_id_map(ctx, pqf)
+    # with open(ctx.category_id_map_filename, "wb") as fp:
+    #     cbor2.dump(category_id_map, fp)
+    print(ctx)
+    with open(ctx.category_id_map_filename, "rb") as fp:
+        category_id_map = cbor2.load(fp)
     create_table(ctx, category_id_map)
