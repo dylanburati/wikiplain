@@ -1,6 +1,8 @@
 package dev.dylanburati.wikiplain.wikidata;
 
 import java.io.IOException;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
@@ -80,16 +82,41 @@ public class Main {
       final Object backendLock = new Object();
       Javalin app = Javalin.create();
       app.ws("/", ws -> {
+        ws.onConnect(ctx -> {
+          ctx.session.setMaxTextMessageSize(16 * 1024 * 1024);
+        });
         ws.onMessage(ctx -> {
           Query request = JsonIterator.deserialize(ctx.message(), Query.class);
           System.err.format("[start] querySize=%d\n", request.args.size());
           synchronized(backendLock) {
+            Iterator<List<String>> results;
             if (request.type == 0) {
-              ctx.send(backend.getEntities(request.args).stream().collect(Collectors.joining("\n")));
+              results = backend.getEntities(request.args).iterator();
             } else if (request.type == 1) {
-              ctx.send(backend.getEntitiesByTitle(request.args).stream().collect(Collectors.joining("\n")));
+              results = backend.getEntitiesByTitle(request.args).iterator();
             } else {
               ctx.send(Map.of("error", "unknown request type"));
+              return;
+            }
+
+            StringBuilder respBuilder = new StringBuilder();
+            int respSize = 0;
+            while (results.hasNext()) {
+              List<String> part = results.next();
+              for (String row : part) {
+                respSize += 1;
+                respBuilder.append(row);
+                respBuilder.append('\n');
+                if (respSize >= 1000) {
+                  respBuilder.append("{\"has_next\": 1}");
+                  ctx.send(respBuilder.toString());
+                  respBuilder.setLength(0);
+                  respSize = 0;
+                }
+              }
+            }
+            if (respSize > 0) {
+              ctx.send(respBuilder.toString());
             }
           }
         });

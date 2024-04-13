@@ -17,13 +17,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.Set;
+import java.util.Spliterator;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import dev.dylanburati.io.Pair;
 
@@ -231,9 +236,9 @@ public class QueryRunner implements Closeable {
   //   return "" + (char) (id >> 56) + (id & (0x00FF_FFFF_FFFF_FFFFL));
   // }
 
-  public List<String> getEntities(Collection<String> ids) throws IOException, InterruptedException, ExecutionException {
+  public Stream<List<String>> getEntities(Collection<String> ids) throws IOException, InterruptedException, ExecutionException {
     if (ids.isEmpty()) {
-      return Collections.emptyList();
+      return Stream.empty();
     }
     double startTime = System.nanoTime() / 1e9;
     List<Long> idList = new ArrayList<>();
@@ -306,13 +311,13 @@ public class QueryRunner implements Closeable {
       }
     }
     if (found.isEmpty()) {
-      return Collections.emptyList();
+      return Stream.empty();
     }
     
     Map<Integer, List<Integer>> foundMap = found.stream().collect(
       Collectors.groupingBy(p -> p.first, Collectors.mapping(p -> p.second, Collectors.toList()))
     );
-    List<Future<List<String>>> tasks = foundMap.entrySet().stream()
+    Set<Future<List<String>>> tasks = foundMap.entrySet().stream()
         .map(e -> this.taskPool.submit(() -> {
           QueryWorker worker = new QueryWorker(
             this.dataFilename,
@@ -321,22 +326,64 @@ public class QueryRunner implements Closeable {
           );
           return worker.selectByLineNumber(e.getValue());
         }))
-        .collect(Collectors.toList());
+        .collect(Collectors.toSet());
 
     System.err.format("[planned] workers=%d\n", tasks.size());
-    List<String> result = new ArrayList<>();
-    for (int i = 0; i < tasks.size(); i++) {
-      result.addAll(this.taskPool.take().get());
-      System.err.format("[progress] %d / %d\n", i + 1, tasks.size());
-    }
-    double finishTime = System.nanoTime() / 1e9;
-    System.err.format("[finish] elapsed=%.3f resultSize=%d\n", finishTime - startTime, result.size());
-    return result;
+    return StreamSupport.stream(new FutureSpliterator(this.taskPool, tasks, startTime), false);
   }
 
-  public List<String> getEntitiesByTitle(Collection<String> titles) throws IOException, InterruptedException, ExecutionException {
+  private static final class FutureSpliterator implements Spliterator<List<String>> {
+    private final CompletionService<List<String>> taskPool;
+    private final Set<Future<List<String>>> tasks;
+    private final double startTime;
+    private int totalTasks;
+
+    private FutureSpliterator(CompletionService<List<String>> taskPool, Set<Future<List<String>>> tasks, double startTime) {
+      this.taskPool = taskPool;
+      this.tasks = tasks;
+      this.startTime = startTime;
+      this.totalTasks = tasks.size();
+    }
+
+    @Override
+    public boolean tryAdvance(Consumer<? super List<String>> action) {
+      if (this.tasks.isEmpty()) {
+        double finishTime = System.nanoTime() / 1e9;
+        System.err.format("[finish] elapsed=%.3f\n", finishTime - this.startTime);
+        return false;
+      }
+      try {
+        Future<List<String>> task = this.taskPool.take();
+        this.tasks.remove(task);
+        action.accept(task.get());
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      } catch (ExecutionException e) {
+        throw new RuntimeException(e);
+      }
+      System.err.format("[progress] %d / %d\n", this.totalTasks - this.tasks.size(), this.totalTasks);
+      return true;
+    }
+
+    @Override
+    public Spliterator<List<String>> trySplit() {
+      return null;
+    }
+
+    @Override
+    public long estimateSize() {
+      return this.tasks.size();
+    }
+
+    @Override
+    public int characteristics() {
+      return Spliterator.SIZED | Spliterator.IMMUTABLE | Spliterator.NONNULL;
+    }
+  }
+
+  public Stream<List<String>> getEntitiesByTitle(Collection<String> titles) throws IOException, InterruptedException, ExecutionException {
     if (titles.isEmpty()) {
-      return Collections.emptyList();
+      return Stream.empty();
     }
     double startTime = System.nanoTime() / 1e9;
     Map<Integer, List<Integer>> foundMap = titles.stream()
@@ -345,7 +392,7 @@ public class QueryRunner implements Closeable {
       .collect(
         Collectors.groupingBy(p -> p.first, Collectors.mapping(p -> p.second, Collectors.toList()))
       );
-    List<Future<List<String>>> tasks = foundMap.entrySet().stream()
+    Set<Future<List<String>>> tasks = foundMap.entrySet().stream()
         .map(e -> this.taskPool.submit(() -> {
           QueryWorker worker = new QueryWorker(
             this.dataFilename,
@@ -354,17 +401,10 @@ public class QueryRunner implements Closeable {
           );
           return worker.selectByLineNumber(e.getValue());
         }))
-        .collect(Collectors.toList());
+        .collect(Collectors.toSet());
 
     System.err.format("[planned] workers=%d\n", tasks.size());
-    List<String> result = new ArrayList<>();
-    for (int i = 0; i < tasks.size(); i++) {
-      result.addAll(this.taskPool.take().get());
-      System.err.format("[progress] %d / %d\n", i + 1, tasks.size());
-    }
-    double finishTime = System.nanoTime() / 1e9;
-    System.err.format("[finish] elapsed=%.3f resultSize=%d\n", finishTime - startTime, result.size());
-    return result;
+    return StreamSupport.stream(new FutureSpliterator(this.taskPool, tasks, startTime), false);
   }
 
   @Override

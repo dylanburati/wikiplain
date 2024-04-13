@@ -9,7 +9,7 @@ error_chain! {
     foreign_links {
         IoError(std::io::Error);
         ParseIntError(std::num::ParseIntError);
-        SerializationError(serde_json::Error);
+        DeserError(nom::error::VerboseError);
     }
     errors {
         EntityError(m: &'static str) {

@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 use crate::Result;
 
+mod item_parser;
+
 pub const TREE_FANOUT: u32 = 256;
 const TREE_FANOUT_LONG: u64 = TREE_FANOUT as u64;
 pub const ENTITIES_PER_GROUP: u32 = 1000;
@@ -274,7 +276,7 @@ fn write_segmented(
     input.read_exact(&mut array_start_buf)?;
     let mut input = BufReader::new(input);
 
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut eof = false;
     let mut group_number: u32 = 0;
     let mut curr_group_offset = 0;
@@ -288,13 +290,13 @@ fn write_segmented(
         let mut entity_number: u32 = 0;
         while !eof && entity_number < ENTITIES_PER_GROUP {
             line.clear();
-            let got = input.read_line(&mut line)?;
+            let got = input.read_until(b'\n', &mut line)?;
             if got == 0 {
                 eof = true;
                 break;
             }
-            let Some(json_str) = line.strip_suffix(",\n") else { continue };
-            let ent: WikidataEntityJson = serde_json::from_str(json_str)?;
+            let Some(json_str) = line.strip_suffix(b",\n") else { continue };
+            let ent: WikidataEntityJson = wikidata_item::parse(json_str)?;
             if let Some(title) = ent.sitelinks.and_then(|s| s.enwiki).map(|e| e.title) {
                 writeln!(output_en, "{}\t{}\t{}", group_number, entity_number, title)?;
                 enwiki_count += 1;
@@ -302,7 +304,7 @@ fn write_segmented(
             let (id_kind, id_num_str) = ent.id.split_at(1);
             let id_num: u64 = id_num_str.parse()?;
             let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
-            output.write_all(json_str.as_bytes())?;
+            output.write_all(json_str)?;
             output.write_all(b"\n")?;
             ind_entries.push((id, group_number, entity_number));
             entity_number += 1;

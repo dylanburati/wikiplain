@@ -441,8 +441,8 @@ impl IntoPy<PyObject> for SqlLiteral {
             nom_sql::Literal::Integer(i) => i.into_py(py),
             nom_sql::Literal::UnsignedInteger(i) => i.into_py(py),
             nom_sql::Literal::FixedPoint(x) => {
-                let v = f64::from(x.integral);
-                let v = if x.fractional == 0 { v } else { v + f64::from(x.fractional) / 10.0 / f64::powi(10.0, i32::try_from(x.fractional.ilog10()).unwrap()) };
+                let rep = x.integral + "." + &x.fractional;
+                let v: f64 = rep.parse().unwrap_or(f64::NAN);
                 v.into_py(py)
             },
             nom_sql::Literal::String(s) => s.into_py(py),
