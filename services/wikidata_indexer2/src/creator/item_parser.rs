@@ -1,29 +1,20 @@
 // based on https://github.com/rust-bakery/parser_benchmarks/blob/master/json/nom/src/main.rs
 use nom::{
     branch::alt,
-    bytes::complete::{escaped, is_a, tag, take_while, take_while1, take_while_m_n},
-    character::complete::{alphanumeric1 as alphanumeric, anychar, char, one_of, satisfy},
-    combinator::{cut, iterator, map, map_res, opt, value},
-    error::{ErrorKind, ParseError, VerboseError},
-    multi::separated_list0,
+    bytes::complete::{tag, take_while, take_while1},
+    character::complete::{anychar, char, one_of},
+    combinator::{all_consuming, cut, map, map_opt, opt, value},
+    error::ParseError,
+    multi::fold_many_m_n,
     number::complete::double,
-    sequence::{delimited, pair, preceded, separated_pair, terminated, tuple},
-    Compare, CompareResult, Err, FindSubstring, IResult, InputIter, InputLength, InputTake,
-    InputTakeAtPosition, Needed, Offset, Slice,
+    sequence::{preceded, terminated, tuple},
+    IResult, Needed, Offset, Parser,
 };
 
-use std::{
-    collections::HashMap,
-    io::{stdin, BufRead, BufReader},
-    iter::{Copied, Enumerate},
-    ops::{Deref, Range, RangeFrom, RangeFull, RangeTo},
-    rc::Rc,
-    slice::Iter,
-    str,
-};
+use std::ops::ControlFlow;
+use std::borrow::Cow;
 
 pub fn is_string_character(c: u8) -> bool {
-    //FIXME: should validate unicode character
     c != b'"' && c != b'\\'
 }
 
@@ -31,237 +22,36 @@ pub fn is_space(c: u8) -> bool {
     c == b' ' || c == b'\t' || c == b'\r' || c == b'\n'
 }
 
-enum JsonPathItem<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonPathItem<'a> {
     Array,
     Key(&'a str),
 }
 
-#[derive(Debug, Clone)]
-struct ParsePath<'a> {
-    prev: Option<Rc<ParsePath<'a>>>,
-    item: JsonPathItem<'a>,
-}
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct SelectorSlice<'a>(&'a [JsonPathItem<'a>]);
 
-#[derive(Debug, Clone)]
-struct ParseState<'a> {
-    input: &'a [u8],
-    path: Option<Rc<ParsePath<'a>>>,
-}
-
-impl<'a> ParseState<'a> {
-    #[inline]
-    pub(crate) fn of(&self, i: &'a [u8]) -> Self {
-        Self {
-            input: i,
-            path: self.path,
-        }
-    }
-
-    pub(crate) fn push_path(&self, item: JsonPathItem<'a>) -> Self {
-        Self {
-            input: self.input,
-            path: Some(Rc::new(ParsePath {
-                prev: self.path.as_ref().map(Rc::clone),
-                item,
-            }))
-        }
-    }
-
-    pub(crate) fn pop_path(&self) -> Option<(Self, &JsonPathItem<'a>)> {
-        let (path, item) = match &self.path {
-            Some(ParsePath { prev, item }) => (prev.as_ref().map(Rc::clone), item),
-            None => return None,
-        };
-
-        let state = Self {
-            input: self.input,
-            path,
-        };
-
-        Some((state, item))
-    }
-}
-
-impl<'a> Deref for ParseState<'a> {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &'a [u8] {
-        self.input
-    }
-}
-
-impl<'a> Slice<Range<usize>> for ParseState<'a> {
-    fn slice(&self, range: Range<usize>) -> Self {
-        self.of(self.input.slice(range))
-    }
-}
-
-impl<'a> Slice<RangeTo<usize>> for ParseState<'a> {
-    fn slice(&self, range: RangeTo<usize>) -> Self {
-        self.of(self.input.slice(range))
-    }
-}
-
-impl<'a> Slice<RangeFrom<usize>> for ParseState<'a> {
-    fn slice(&self, range: RangeFrom<usize>) -> Self {
-        self.of(self.input.slice(range))
-    }
-}
-
-impl<'a> Slice<RangeFull> for ParseState<'a> {
-    fn slice(&self, range: RangeFull) -> Self {
-        self.of(self.input.slice(range))
-    }
-}
-
-impl<'a, 'b> FindSubstring<&'b str> for ParseState<'a> {
-    fn find_substring(&self, substr: &str) -> Option<usize> {
-        self.input.find(substr)
-    }
-}
-
-impl<'a, 'b> Compare<&'b str> for ParseState<'a> {
-    #[inline]
-    fn compare(&self, t: &'b str) -> CompareResult {
-        self.input.compare(t)
-    }
-
-    #[inline]
-    fn compare_no_case(&self, t: &'b str) -> CompareResult {
-        self.input.compare_no_case(t)
-    }
-}
-
-impl<'a> InputLength for ParseState<'a> {
-    #[inline]
-    fn input_len(&self) -> usize {
-        self.len()
-    }
-}
-
-impl<'a> InputIter for ParseState<'a> {
-    type Item = u8;
-    type Iter = Enumerate<Self::IterElem>;
-    type IterElem = Copied<Iter<'a, u8>>;
-
-    #[inline]
-    fn iter_indices(&self) -> Self::Iter {
-        self.iter_elements().enumerate()
-    }
-    #[inline]
-    fn iter_elements(&self) -> Self::IterElem {
-        self.iter().copied()
-    }
-    #[inline]
-    fn position<P>(&self, predicate: P) -> Option<usize>
-    where
-        P: Fn(Self::Item) -> bool,
-    {
-        self.iter().position(|b| predicate(*b))
-    }
-    #[inline]
-    fn slice_index(&self, count: usize) -> Result<usize, Needed> {
-        if self.len() >= count {
-            Ok(count)
-        } else {
-            Err(Needed::new(count - self.len()))
+impl SelectorSlice<'_> {
+    pub fn strip_first(&self, prefix: &JsonPathItem) -> Option<Self> {
+        match self.0.split_first() {
+            Some((first, rest)) if first == prefix => Some(Self(rest)),
+            _ => None,
         }
     }
 }
 
-impl<'a> InputTake for ParseState<'a> {
-    #[inline]
-    fn take(&self, count: usize) -> Self {
-        let s = self.input.take(count);
-        self.of(s)
-    }
-    #[inline]
-    fn take_split(&self, count: usize) -> (Self, Self) {
-        let (l, r) = self.input.take_split(count);
-        (self.of(l), self.of(r))
+impl<'a> From<&'a Selector<'a>> for SelectorSlice<'a> {
+    fn from(value: &'a Selector<'a>) -> Self {
+        SelectorSlice(&value.0)
     }
 }
 
-impl<'a> InputTakeAtPosition for ParseState<'a> {
-    type Item = char;
+pub struct Selector<'a>(Vec<JsonPathItem<'a>>);
 
-    #[inline]
-    fn split_at_position<P, E: ParseError<Self>>(&self, predicate: P) -> IResult<Self, Self, E>
-    where
-        P: Fn(Self::Item) -> bool,
-    {
-        match self.input.split_at_position::<_, (&str, ErrorKind)>(predicate) {
-            Ok((l, r)) => Ok((self.of(l), self.of(r))),
-            Err(Err::Error((i, kind))) => Err(Err::Error(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Failure((i, kind))) => Err(Err::Failure(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Incomplete(x)) => Err(Err::Incomplete(x)),
-        }
-    }
-
-    #[inline]
-    fn split_at_position1<P, E: ParseError<Self>>(
-        &self,
-        predicate: P,
-        e: ErrorKind,
-    ) -> IResult<Self, Self, E>
-    where
-        P: Fn(Self::Item) -> bool,
-    {
-        match self
-            .input
-            .split_at_position1::<_, (&str, ErrorKind)>(predicate, e)
-        {
-            Ok((l, r)) => Ok((self.of(l), self.of(r))),
-            Err(Err::Error((i, kind))) => Err(Err::Error(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Failure((i, kind))) => Err(Err::Failure(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Incomplete(x)) => Err(Err::Incomplete(x)),
-        }
-    }
-
-    #[inline]
-    fn split_at_position_complete<P, E: ParseError<Self>>(
-        &self,
-        predicate: P,
-    ) -> IResult<Self, Self, E>
-    where
-        P: Fn(Self::Item) -> bool,
-    {
-        match self
-            .input
-            .split_at_position_complete::<_, (&str, ErrorKind)>(predicate)
-        {
-            Ok((l, r)) => Ok((self.of(l), self.of(r))),
-            Err(Err::Error((i, kind))) => Err(Err::Error(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Failure((i, kind))) => Err(Err::Failure(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Incomplete(x)) => Err(Err::Incomplete(x)),
-        }
-    }
-
-    #[inline]
-    fn split_at_position1_complete<P, E: ParseError<Self>>(
-        &self,
-        predicate: P,
-        e: ErrorKind,
-    ) -> IResult<Self, Self, E>
-    where
-        P: Fn(Self::Item) -> bool,
-    {
-        match self
-            .input
-            .split_at_position1_complete::<_, (&str, ErrorKind)>(predicate, e)
-        {
-            Ok((l, r)) => Ok((self.of(l), self.of(r))),
-            Err(Err::Error((i, kind))) => Err(Err::Error(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Failure((i, kind))) => Err(Err::Failure(E::from_error_kind(self.of(i), kind))),
-            Err(Err::Incomplete(x)) => Err(Err::Incomplete(x)),
-        }
-    }
-}
-
-impl<'a> Offset for ParseState<'a> {
-    fn offset(&self, second: &Self) -> usize {
-        self.input.offset(second.input)
+impl<'a> Selector<'a> {
+    pub fn new(items: Vec<JsonPathItem<'a>>) -> Self {
+        Self(items)
     }
 }
 
@@ -269,32 +59,161 @@ fn sp<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], &[u8], E> {
     take_while(is_space)(i)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue<'a> {
     Null,
-    Str(&'a str),
+    Str(Cow<'a, str>),
     Boolean(bool),
     Num(f64),
     Array(Vec<JsonValue<'a>>),
-    Object(Vec<(&'a str, JsonValue<'a>)>),
+    Object(Vec<(Cow<'a, str>, JsonValue<'a>)>),
 }
 
-//FIXME: handle the cases like \u1234
-fn string<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], &str, E> {
+fn string<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], Cow<'a, str>, E> {
+    let (i1, _) = char('\"')(i)?;
+    let (i2, s) = cut(string_interior)(i1)?;
+    let (i3, _) = char('"')(i2)?;
+    Ok((i3, s))
+}
+
+fn string_interior<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], Cow<'a, str>, E> {
+    let (mut i1, plain) = take_while(is_string_character)(i)?;
+    if let (_, Some(_)) = opt(char('"'))(i1)? {
+        let Ok(v) = std::str::from_utf8(plain) else {
+            return Err(nom::Err::Error(E::from_error_kind(
+                i,
+                nom::error::ErrorKind::Fail,
+            )));
+        };
+        return Ok((i1, Cow::Borrowed(v)));
+    };
+    // input:           "beginning\u1234\nmiddle\end"
+    //  i always points ^         |     |       |   |
+    // first escape:              ^i1   ^i2     |   |
+    // loop1:                           ^i1     ^i2 |
+    // loop2:                                   ^i1 ^i2
+    // outside:                                     ^i1
+    let mut acc = Vec::with_capacity(plain.len() + 4);
+    acc.extend_from_slice(plain);
+    match i1.get(0) {
+        Some(b'\\') => {
+            let (i2, chr) = alt((uniescape, hex_escape, octal_escape, anychar))(&i1[1..])?;
+            let l = acc.len();
+            let chrlen = chr.len_utf8();
+            acc.resize(l + chrlen, 0);
+            let _ = chr.encode_utf8(&mut acc[l..]);
+            i1 = i2;
+        }
+        _ => {
+            return Err(nom::Err::Error(E::from_error_kind(
+                i,
+                nom::error::ErrorKind::Char,
+            )));
+        }
+    };
+    let mut normal = take_while1(is_string_character);
+    loop {
+        match normal.parse(i1) {
+            Ok((i2, _)) => {
+                if i2.len() == 0 {
+                    i1 = i2;
+                    break;
+                } else if i2.len() == i1.len() {
+                    return Err(nom::Err::Error(E::from_error_kind(
+                        i2,
+                        nom::error::ErrorKind::EscapedTransform,
+                    )));
+                } else {
+                    acc.extend_from_slice(&i1[..i1.offset(&i2)]);
+                    i1 = i2;
+                }
+            }
+            Err(nom::Err::Error(_)) => match i1.get(0) {
+                Some(b'\\') => {
+                    let (i2, chr) = alt((uniescape, hex_escape, octal_escape, anychar))(&i1[1..])?;
+                    let l = acc.len();
+                    let chrlen = chr.len_utf8();
+                    acc.resize(l + chrlen, 0);
+                    let _ = chr.encode_utf8(&mut acc[l..]);
+                    i1 = i2;
+                }
+                Some(b'"') => break,
+                _ => {
+                    return Err(nom::Err::Error(E::from_error_kind(
+                        i,
+                        nom::error::ErrorKind::Char,
+                    )));
+                }
+            },
+            Err(other) => return Err(other),
+        }
+    }
+    let Ok(v) = String::from_utf8(acc) else {
+        return Err(nom::Err::Error(E::from_error_kind(
+            i,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+    Ok((i1, Cow::Owned(v)))
+}
+
+fn uniescape<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], char, E> {
     preceded(
-        char('\"'),
-        cut(terminated(
-            map(
-                escaped(
-                    take_while1(is_string_character),
-                    '\\',
-                    alt((uniescape, hex_escape, octal_escape, anychar)),
-                ),
-                |bytes| str::from_utf8(bytes).unwrap(),
-            ),
-            char('\"'),
-        )),
+        char('u'),
+        map_opt(
+            tuple((
+                one_of("0123456789abcdefABCDEF"),
+                one_of("0123456789abcdefABCDEF"),
+                one_of("0123456789abcdefABCDEF"),
+                one_of("0123456789abcdefABCDEF"),
+            )),
+            |(d3, d2, d1, d0)| {
+                let code = (d3.to_digit(16).unwrap() << 12)
+                    | (d2.to_digit(16).unwrap() << 8)
+                    | (d1.to_digit(16).unwrap() << 4)
+                    | d0.to_digit(16).unwrap();
+                char::from_u32(code)
+            },
+        ),
     )(i)
+}
+
+fn hex_escape<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], char, E> {
+    terminated(
+        char('x'),
+        map(
+            tuple((
+                one_of("0123456789abcdefABCDEF"),
+                one_of("0123456789abcdefABCDEF"),
+            )),
+            |(d1, d0)| {
+                let code = (d1.to_digit(16).unwrap() << 4) | d0.to_digit(16).unwrap();
+                char::from_u32(code).unwrap()
+            },
+        ),
+    )(i)
+}
+
+fn octal_escape<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], char, E> {
+    let (i1, d) = one_of("01234567")(i)?;
+    let (i2, code) = if d <= '3' {
+        fold_many_m_n(
+            0,
+            2,
+            one_of("01234567"),
+            || d.to_digit(8).unwrap(),
+            |n, di| (n << 3) | di.to_digit(8).unwrap(),
+        )(i1)?
+    } else {
+        fold_many_m_n(
+            0,
+            1,
+            one_of("01234567"),
+            || d.to_digit(8).unwrap(),
+            |n, di| (n << 3) | di.to_digit(8).unwrap(),
+        )(i1)?
+    };
+    Ok((i2, char::from_u32(code).unwrap()))
 }
 
 fn null<'a, E: ParseError<&'a [u8]>>(input: &'a [u8]) -> IResult<&'a [u8], (), E> {
@@ -305,129 +224,167 @@ fn boolean<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], bool, E> 
     alt((map(tag("false"), |_| false), map(tag("true"), |_| true)))(i)
 }
 
-fn array<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], Vec<JsonValue>, E> {
-    preceded(
-        char('['),
-        cut(terminated(
-            separated_list0(preceded(sp, char(',')), json_value),
-            preceded(sp, char(']')),
-        )),
-    )(i)
-}
-
-fn key_value<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], (&str, JsonValue), E> {
-    separated_pair(
-        preceded(sp, string),
-        cut(preceded(sp, char(':'))),
-        json_value,
-    )(i)
-}
-
-fn hash<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], Vec<(&str, JsonValue)>, E> {
-    preceded(
-        char('{'),
-        cut(terminated(
-            separated_list0(preceded(sp, char(',')), key_value),
-            preceded(sp, char('}')),
-        )),
-    )(i)
-}
-
-fn json_value<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], JsonValue, E> {
-    preceded(
-        sp,
-        alt((
-            map(hash, JsonValue::Object),
-            map(array, JsonValue::Array),
-            map(string, JsonValue::Str),
-            map(double, JsonValue::Num),
-            map(boolean, JsonValue::Boolean),
-            map(null, |_| JsonValue::Null),
-        )),
-    )(i)
-}
-
-fn root<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&[u8], JsonValue, E> {
-    delimited(
-        sp,
-        alt((map(hash, JsonValue::Object), map(array, JsonValue::Array))),
-        opt(sp),
-    )(i)
-}
-
-fn uniescape<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], char, E> {
-    terminated(
-        char('u'),
-        tuple((
-            one_of("0123456789abcdefABCDEF"),
-            one_of("0123456789abcdefABCDEF"),
-            one_of("0123456789abcdefABCDEF"),
-            one_of("0123456789abcdefABCDEF"),
-        )),
-    )(i)
-}
-
-fn hex_escape<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], char, E> {
-    terminated(
-        char('x'),
-        tuple((
-            one_of("0123456789abcdefABCDEF"),
-            one_of("0123456789abcdefABCDEF"),
-        )),
-    )(i)
-}
-
-fn octal_escape<'a, E: ParseError<&'a [u8]>>(i: &'a [u8]) -> IResult<&'a [u8], char, E> {
-    let (i1, c1) = one_of("01234567")(i)?;
-    if c1 <= '3' {
-        let (i2, _) = take_while_m_n(0, 2, |c| c >= b'0' && c <= b'7')(i1)?;
-        Ok((i2, c1))
-    } else {
-        let (i2, _) = take_while_m_n(0, 1, |c| c >= b'0' && c <= b'7')(i1)?;
-        Ok((i2, c1))
-    }
-}
-
-fn main() {
-    let inp = BufReader::new(stdin());
-    let mut unique = HashMap::new();
-    for line_res in inp.lines() {
-        let line = line_res.unwrap();
-        let json = match root::<VerboseError<&[u8]>>(line.as_bytes()) {
-            Ok((_, d)) => d,
-            Err(e) => {
-                panic!(
-                    "{:?}",
-                    e.map(|inner| inner
-                        .errors
-                        .into_iter()
-                        .map(|(i, k)| (str::from_utf8(i).unwrap_or_else(|_| "<non-utf8>"), k))
-                        .collect::<Vec<_>>())
-                )
-            }
+fn array<'a, E: ParseError<&'a [u8]>>(
+    i: &'a [u8],
+    selectors: Vec<SelectorSlice<'a>>,
+) -> IResult<&'a [u8], JsonValue<'a>, E> {
+    let (i, _) = char('[')(i)?;
+    if let (post, Some(_)) = opt(preceded(sp, char(']')))(i)? {
+        let a = if selectors.is_empty() {
+            JsonValue::Null
+        } else {
+            JsonValue::Array(vec![])
         };
-        let mut stack = vec![(json, false)];
-        while let Some((el, should_print)) = stack.pop() {
-            match el {
-                JsonValue::Null | JsonValue::Boolean(_) | JsonValue::Num(_) => {}
-                JsonValue::Str(s) => {
-                    if should_print {
-                        match unique.entry(s.to_owned()) {
-                            std::collections::hash_map::Entry::Occupied(_) => {}
-                            e @ std::collections::hash_map::Entry::Vacant(_) => {
-                                println!("{}", e.key());
-                                e.or_insert(());
-                            }
-                        }
-                    }
+        return Ok((post, a));
+    };
+
+    let (i1, first_elem) = json_value(i, selectors.clone())?;
+    let (mut i2, _) = sp(i1)?;
+    let mut delim_parser = alt((
+        map(char(','), |_| ControlFlow::Continue(())),
+        map(char(']'), |_| ControlFlow::Break(())),
+    ));
+    if selectors.is_empty() {
+        loop {
+            match delim_parser.parse(i2)? {
+                (ielem, ControlFlow::Continue(_)) => {
+                    // discard
+                    let (i3, _) = json_value(ielem, selectors.clone())?;
+                    let (i4, _) = sp(i3)?;
+                    i2 = i4;
                 }
-                JsonValue::Array(a) => {
-                    stack.extend(a.into_iter().rev().map(|e| (e, false)));
-                }
-                JsonValue::Object(obj) => {
-                    stack.extend(obj.into_iter().rev().map(|(k, v)| (v, k == "globe")));
-                }
+                (post, ControlFlow::Break(_)) => return Ok((post, JsonValue::Null)),
             }
         }
     }
+
+    let mut elems = vec![first_elem];
+    loop {
+        match delim_parser.parse(i2)? {
+            (ielem, ControlFlow::Continue(_)) => {
+                let (i3, curr_elem) = json_value(ielem, selectors.clone())?;
+                let (i4, _) = sp(i3)?;
+                elems.push(curr_elem);
+                i2 = i4;
+            }
+            (post, ControlFlow::Break(_)) => return Ok((post, JsonValue::Array(elems))),
+        }
+    }
+}
+
+fn key_value<'a, E: ParseError<&'a [u8]>>(
+    i: &'a [u8],
+    selectors: Vec<SelectorSlice<'a>>,
+) -> IResult<&'a [u8], (Cow<'a, str>, JsonValue<'a>), E> {
+    let (i1, key) = preceded(sp, string)(i)?;
+    let (i2, _) = cut(preceded(sp, char(':')))(i1)?;
+    let prefix = JsonPathItem::Key(&key);
+    let inner_selectors = selectors
+        .into_iter()
+        .filter_map(|sel| sel.strip_first(&prefix))
+        .collect();
+    let (i3, value) = json_value(i2, inner_selectors)?;
+    Ok((i3, (key, value)))
+}
+
+fn hash<'a, E: ParseError<&'a [u8]>>(
+    i: &'a [u8],
+    selectors: Vec<SelectorSlice<'a>>,
+) -> IResult<&'a [u8], JsonValue<'a>, E> {
+    let (i, _) = char('{')(i)?;
+    if let (post, Some(_)) = opt(preceded(sp, char('}')))(i)? {
+        let h = if selectors.is_empty() {
+            JsonValue::Null
+        } else {
+            JsonValue::Object(vec![])
+        };
+        return Ok((post, h));
+    };
+
+    let (i1, first_kv) = key_value(i, selectors.clone())?;
+    let (mut i2, _) = sp(i1)?;
+    let mut delim_parser = alt((
+        map(char(','), |_| ControlFlow::Continue(())),
+        map(char('}'), |_| ControlFlow::Break(())),
+    ));
+    if selectors.is_empty() {
+        loop {
+            match delim_parser.parse(i2)? {
+                (ikv, ControlFlow::Continue(_)) => {
+                    // discard
+                    let (i3, _) = key_value(ikv, selectors.clone())?;
+                    let (i4, _) = sp(i3)?;
+                    i2 = i4;
+                }
+                (post, ControlFlow::Break(_)) => return Ok((post, JsonValue::Null)),
+            }
+        }
+    }
+
+    let mut kvs = vec![];
+    let keep_all = selectors.iter().any(|sel| sel.0.is_empty()); // fully matched selector slice
+    if keep_all
+        || selectors
+            .iter()
+            .any(|sel| matches!(sel.0.first(), Some(JsonPathItem::Key(k)) if &first_kv.0 == k))
+    {
+        kvs.push(first_kv);
+    }
+    loop {
+        match delim_parser.parse(i2)? {
+            (ikv, ControlFlow::Continue(_)) => {
+                // keep
+                let (i3, curr_kv) = key_value(ikv, selectors.clone())?;
+                let (i4, _) = sp(i3)?;
+                if keep_all
+                    || selectors.iter().any(
+                        |sel| matches!(sel.0.first(), Some(JsonPathItem::Key(k)) if &curr_kv.0 == k),
+                    )
+                {
+                    kvs.push(curr_kv);
+                }
+                i2 = i4;
+            }
+            (post, ControlFlow::Break(_)) => return Ok((post, JsonValue::Object(kvs))),
+        }
+    }
+}
+
+fn json_value<'a, E: ParseError<&'a [u8]>>(
+    i: &'a [u8],
+    selectors: Vec<SelectorSlice<'a>>,
+) -> IResult<&'a [u8], JsonValue<'a>, E> {
+    let (rest, _) = sp(i)?;
+    match rest.get(0) {
+        Some(byte) => match byte {
+            b'{' => hash(rest, selectors),
+            b'[' => {
+                let prefix = JsonPathItem::Array;
+                let inner_selectors = selectors
+                    .into_iter()
+                    .filter_map(|sel| sel.strip_first(&prefix))
+                    .collect();
+                array(rest, inner_selectors)
+            }
+            b'"' => map(string, JsonValue::Str)(rest),
+            b't' | b'f' => map(boolean, JsonValue::Boolean)(rest),
+            b'n' => value(JsonValue::Null, null)(rest),
+            b'-' | b'0'..=b'9' => map(double, JsonValue::Num)(rest),
+            _ => Err(nom::Err::Error(E::from_error_kind(
+                rest,
+                nom::error::ErrorKind::Char,
+            ))),
+        },
+        None => Err(nom::Err::Incomplete(Needed::new(1))),
+    }
+}
+
+pub(crate) fn parse_json<'a, E: ParseError<&'a [u8]>>(
+    input: &'a [u8],
+    selectors: &'a [Selector<'a>],
+) -> IResult<&'a [u8], JsonValue<'a>, E> {
+    let selector_slices = selectors.iter().map(|e| e.into()).collect();
+    let (trailing, value) = json_value(input, selector_slices)?;
+    let (empty, _) = all_consuming(sp)(trailing)?;
+    Ok((empty, value))
 }

@@ -9,12 +9,14 @@ error_chain! {
     foreign_links {
         IoError(std::io::Error);
         ParseIntError(std::num::ParseIntError);
-        DeserError(nom::error::VerboseError);
     }
     errors {
         EntityError(m: &'static str) {
             description("wikidata entity error"),
             display("wikidata entity error: {}", m)
+        }
+        ParseJsonError {
+            description("parse json error")
         }
     }
 }
