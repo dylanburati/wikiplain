@@ -1,15 +1,14 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::{mpsc::sync_channel, Arc, Condvar, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use futures::io::{BufReader, BufWriter};
 use memmap2::Mmap;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Deserialize;
 use soketto::handshake::{server::Response as HandshakeResponse, Server};
-use tokio::{net::TcpListener, runtime::Runtime, sync::Mutex, task::JoinHandle};
+use tokio::{net::TcpListener, runtime::Runtime};
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use zstd::{dict::DecoderDictionary, stream::write::Decoder};
@@ -325,59 +324,6 @@ struct Query {
     args: Vec<String>,
 }
 
-struct Pool<T> {
-    data: StdMutex<Vec<T>>,
-    condition: Condvar,
-}
-
-struct PoolGuard<'a, T> {
-    pool: &'a Pool<T>,
-    inner: Option<T>,
-}
-
-impl<'a, T> std::ops::Deref for PoolGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.inner.as_ref().unwrap()
-    }
-}
-
-impl<'a, T> std::ops::DerefMut for PoolGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner.as_mut().unwrap()
-    }
-}
-
-impl<T> Drop for PoolGuard<'_, T> {
-    fn drop(&mut self) {
-        let mut vec = self.pool.data.lock().unwrap();
-        vec.push(self.inner.take().unwrap());
-        self.pool.condition.notify_one();
-    }
-}
-
-impl<T> Pool<T> {
-    fn get<'a>(&'a self) -> PoolGuard<'a, T> {
-        let mut vec = self.data.lock().unwrap();
-        while vec.is_empty() {
-            vec = self.condition.wait(vec).unwrap();
-        }
-        let item = vec.pop().unwrap();
-        PoolGuard {
-            pool: self,
-            inner: Some(item),
-        }
-    }
-
-    fn new(data: Vec<T>) -> Self {
-        Self {
-            data: StdMutex::new(data),
-            condition: Condvar::new(),
-        }
-    }
-}
-
 async fn serve_async(path: &str, port: u16) -> Result<()> {
     let base = path.strip_suffix(".zst").unwrap_or(path);
     let dicts_path = base.to_string() + ".zdicts";
@@ -392,12 +338,7 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
     let index_mapped = unsafe { Mmap::map(&index_file)? };
     let wd_index = WikidataIndex::try_from(&index_mapped[..])?;
     let dicts = read_dicts_file(&wd_index, &dicts_path)?;
-    let mut data_file_vec = vec![];
-    for _ in 0..512 {
-        let f = OpenOptions::new().read(true).open(path)?;
-        data_file_vec.push(f);
-    }
-    let data_files = Arc::new(Pool::new(data_file_vec));
+    let data_file_shared = StdMutex::new(OpenOptions::new().read(true).open(path)?);
     // let summary: Vec<_> = dicts.iter().map(|(k, v)| (k, v.as_ddict().get_dict_id())).collect();
     // println!("{:?}", summary);
 
@@ -422,15 +363,13 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
             protocol: None,
         };
         websocket.send_response(&accept).await?;
-        let (sender, mut receiver) = websocket.into_builder().finish();
-        let sender_shared = Arc::new(Mutex::new(sender));
+        let (mut sender, mut receiver) = websocket.into_builder().finish();
         let mut message = Vec::new();
 
         loop {
             message.clear();
             match receiver.receive_data(&mut message).await {
                 Ok(soketto::Data::Binary(_)) => {
-                    let mut sender = sender_shared.lock().await;
                     sender
                         .send_text("{\"error\": \"expected text message\"}")
                         .await?;
@@ -438,7 +377,6 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                 }
                 Ok(soketto::Data::Text(_)) => {
                     let t0 = Instant::now();
-                    let mut sender = sender_shared.lock().await;
                     let query: Query = match serde_json::from_slice(&message) {
                         Ok(q) => q,
                         Err(_) => {
@@ -508,75 +446,53 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                     if !data_ranges.is_empty() {
                         workers.push((Arc::clone(dict0), data_ranges));
                     }
-                    drop(sender);
-                    let sender_shared1 = Arc::clone(&sender_shared);
-                    let data_files = Arc::clone(&data_files);
-                    let (data_consumer, data_supplier) = sync_channel(64);
-                    let tx_task = tokio::spawn(async move {
-                        workers
-                            .par_iter()
-                            .flat_map_iter(|(dict, rng_list)| {
-                                rng_list
-                                    .into_iter()
-                                    .map(|(offset, length)| -> Result<Vec<u8>> {
-                                        let mut data_file = data_files.get();
-                                        let _ = data_file.seek(SeekFrom::Start(*offset))?;
-                                        let mut buf = vec![0u8; *length as usize];
-                                        data_file.read_exact(&mut buf)?;
-                                        let out = Vec::new();
-                                        let mut decoder =
-                                            Decoder::with_prepared_dictionary(out, dict)?;
-                                        decoder.write_all(&buf)?;
-                                        decoder.flush()?;
-                                        Ok(decoder.into_inner())
-                                    })
-                            })
-                            .try_for_each_with(data_consumer, |ch, line_res| -> Result<()> {
-                                let line = line_res?;
-                                ch.send(line).unwrap();
-                                Ok(())
-                            })
-                    });
-                    let rx_task: JoinHandle<Result<()>> = tokio::spawn(async move {
-                        let mut response = Vec::new();
-                        let mut sender = sender_shared1.lock().await;
-                        let mut n_lines = 0;
-                        for line in data_supplier.into_iter() {
-                            n_lines += 1;
-                            eprint!(
-                                "\r\x1b[Kprogress: {:>4} / {} [{}ms]",
-                                n_lines,
-                                query_size,
-                                t0.elapsed().as_millis(),
-                            );
-                            response.extend(line);
-                            response.push(b'\n');
-                            if response.len() > 32 * 1024 * 1024 {
-                                response.extend("{\"has_next\": 1}".as_bytes());
-                                // safety: `response` was parsed as json in the create step, which
-                                // would have errored on non-utf8 chars. Also, the send_text call only uses
-                                // str::as_bytes.
-                                let response_str =
-                                    unsafe { std::str::from_utf8_unchecked(&response) };
-                                sender.send_text(response_str).await?;
-                                sender.flush().await?;
-                                response.clear();
-                            }
+                    let line_results = workers
+                        .iter()
+                        .flat_map(|(dict, rng_list)| {
+                            rng_list
+                                .into_iter()
+                                .map(|(offset, length)| -> Result<Vec<u8>> {
+                                    let mut data_file = data_file_shared.lock().unwrap();
+                                    let _ = data_file.seek(SeekFrom::Start(*offset))?;
+                                    let mut buf = vec![0u8; *length as usize];
+                                    data_file.read_exact(&mut buf)?;
+                                    let out = Vec::new();
+                                    let mut decoder =
+                                        Decoder::with_prepared_dictionary(out, dict)?;
+                                    decoder.write_all(&buf)?;
+                                    decoder.flush()?;
+                                    Ok(decoder.into_inner())
+                                })
+                        });
+                    let mut response = Vec::new();
+                    let mut n_lines = 0;
+                    for line_res in line_results {
+                        let line = line_res?;
+                        n_lines += 1;
+                        eprint!(
+                            "\r\x1b[Kprogress: {:>4} / {} [{}ms]",
+                            n_lines,
+                            query_size,
+                            t0.elapsed().as_millis(),
+                        );
+                        response.extend(line);
+                        response.push(b'\n');
+                        if response.len() > 32 * 1024 * 1024 {
+                            response.extend("{\"has_next\": 1}".as_bytes());
+                            // safety: `response` was parsed as json in the create step, which
+                            // would have errored on non-utf8 chars. Also, the send_text call only uses
+                            // str::as_bytes.
+                            let response_str =
+                                unsafe { std::str::from_utf8_unchecked(&response) };
+                            sender.send_text(response_str).await?;
+                            sender.flush().await?;
+                            response.clear();
                         }
-                        eprintln!();
-                        let response_str = unsafe { std::str::from_utf8_unchecked(&response) };
-                        sender.send_text(response_str).await?;
-                        sender.flush().await?;
-                        Ok(())
-                    });
-
-                    match tokio::join!(tx_task, rx_task) {
-                        (Err(txe), _) => return Err(txe.into()),
-                        (Ok(_), Err(rxe)) => return Err(rxe.into()),
-                        (Ok(Err(txe)), Ok(_)) => return Err(txe),
-                        (Ok(Ok(_)), Ok(Err(rxe))) => return Err(rxe),
-                        (Ok(Ok(_)), Ok(Ok(_))) => {}
                     }
+                    eprintln!();
+                    let response_str = unsafe { std::str::from_utf8_unchecked(&response) };
+                    sender.send_text(response_str).await?;
+                    sender.flush().await?;
                 }
                 Err(soketto::connection::Error::Closed) => break,
                 Err(e) => return Err(e.into()),
