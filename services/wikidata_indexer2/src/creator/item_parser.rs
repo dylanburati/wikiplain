@@ -11,8 +11,8 @@ use nom::{
     IResult, Needed, Offset, Parser,
 };
 
-use std::ops::ControlFlow;
 use std::borrow::Cow;
+use std::ops::ControlFlow;
 
 pub fn is_string_character(c: u8) -> bool {
     c != b'"' && c != b'\\'

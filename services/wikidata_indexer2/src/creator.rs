@@ -2,21 +2,26 @@ use std::borrow::Borrow;
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use flate2::read::MultiGzDecoder;
 use nom::error::VerboseError;
-use zstd::Encoder as ZstdEncoder;
+use nom::AsBytes;
+use rand::Rng;
+use zstd::bulk::Compressor;
+use zstd::dict::EncoderDictionary;
 
-use crate::{Result, ErrorKind};
 use crate::creator::item_parser::JsonValue;
+use crate::{ErrorKind, Result};
 
-use self::item_parser::{Selector, JsonPathItem};
+use self::item_parser::{JsonPathItem, Selector};
 
 mod item_parser;
 
 pub const TREE_FANOUT: u32 = 256;
 const TREE_FANOUT_LONG: u64 = TREE_FANOUT as u64;
-pub const ENTITIES_PER_GROUP: u32 = 1000;
+pub const CDICT_SIZE: usize = 128 * 1024;
+pub const ENTITIES_PER_CDICT: usize = 100000;
 
 struct LevelDesc {
     /// Number of nodes; The first `width-2` have `TREE_FANOUT` pointers
@@ -86,8 +91,9 @@ impl LevelDesc {
         Self::new(full_nodes + 1, children1, children2)
     }
 
+    /// Only valid for the root and intermediate levels; the leaf levels have size (node_size * sizeof(LeafData))
     fn byte_size(&self) -> u64 {
-        // The nodes in this level look like:
+        // `is_leaf` false --> the nodes in this level look like:
         // [ct, ...keys (length: ct - 1), ...pointers (length: ct - 1)][ct, ...keys etc.]
         //  0,  8,                        8*ct,                        16*ct
         let mut result = 0;
@@ -142,7 +148,7 @@ impl<R: Read> DiskIter<R> {
 }
 
 impl<R: Read> Iterator for DiskIter<R> {
-    type Item = std::io::Result<(u64, u64)>;
+    type Item = std::io::Result<(u64, u64, u32)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut buf = [0u8; 8];
@@ -161,12 +167,18 @@ impl<R: Read> Iterator for DiskIter<R> {
             Err(err) => return Some(Err(err)),
         };
 
-        Some(Ok((a, b)))
+        let mut buf = [0u8; 4];
+        let c = match self.inner.read_exact(&mut buf) {
+            Ok(_) => u32::from_be_bytes(buf),
+            Err(err) => return Some(Err(err)),
+        };
+
+        Some(Ok((a, b, c)))
     }
 }
 
 #[derive(PartialEq, Eq)]
-struct DatumWrapper((u64, u64), usize);
+struct DatumWrapper((u64, u64, u32), usize);
 
 impl PartialOrd for DatumWrapper {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -183,7 +195,7 @@ impl Ord for DatumWrapper {
 struct Segmented {
     group_offsets: Vec<u64>,
     staged_count: u64,
-    ind_entries: Vec<(u64, u64)>,
+    ind_entries: Vec<(u64, u64, u32)>,
     prop_staged_count: u64,
     prop_ind_entries: Vec<(u64, u64)>,
 }
@@ -193,16 +205,23 @@ const STG_BLOCK_LIMIT: usize = 16 * 1000 * 1024;
 
 pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result<()> {
     let base = output_path.strip_suffix(".zst").unwrap_or(output_path);
+    let output_dicts_path = base.to_string() + ".zdicts";
     let output_index_path = base.to_string() + ".index.bin";
     let output_index_en_path = base.to_string() + "-en.index.txt";
     let working_path_secondary = working_path.to_string() + "2";
 
     let file_input = OpenOptions::new().read(true).open(input_path)?;
+    let file_input2 = OpenOptions::new().read(true).open(input_path)?;
     let file_output = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(output_path)?;
+    let file_dicts = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(output_dicts_path)?;
     let file_en = OpenOptions::new()
         .create(true)
         .write(true)
@@ -221,44 +240,111 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
         .truncate(true)
         .open(working_path_secondary)?;
 
-    let segmented = write_segmented(file_input, file_output, file_en, file_stg, file_stg_secondary)?;
-    let file_ind = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(output_index_path)?;
-    let mut staged_entry_files = vec![];
-    let mut stg_offset = 0;
-    while stg_offset < 16 * segmented.staged_count {
-        let mut reader = OpenOptions::new().read(true).open(working_path)?;
-        let _ = reader.seek(SeekFrom::Start(stg_offset))?;
-        staged_entry_files.push(reader.take(16 * STG_BLOCK_LIMIT as u64));
-        stg_offset += 16 * STG_BLOCK_LIMIT as u64;
-    }
-    let _ = write_index(
-        segmented.ind_entries,
-        segmented.group_offsets,
-        staged_entry_files,
-        segmented.staged_count,
-        file_ind,
-    )?;
+    let (dict_consumer, dict_supplier) = sync_channel::<Result<Vec<u8>>>(4);
+    std::thread::scope(|s| -> Result<()> {
+        s.spawn(
+            || match get_zstd_dicts(file_input2, dict_consumer.clone()) {
+                Ok(_) => {}
+                Err(e) => dict_consumer.send(Err(e)).unwrap(),
+            },
+        );
+
+        let segmented = write_segmented(
+            file_input,
+            file_output,
+            file_dicts,
+            file_en,
+            file_stg,
+            file_stg_secondary,
+            dict_supplier,
+        )?;
+        let file_ind = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(output_index_path)?;
+        let mut staged_entry_files = vec![];
+        let mut stg_offset = 0;
+        while stg_offset < 16 * segmented.staged_count {
+            let mut reader = OpenOptions::new().read(true).open(working_path)?;
+            let _ = reader.seek(SeekFrom::Start(stg_offset))?;
+            staged_entry_files.push(reader.take(16 * STG_BLOCK_LIMIT as u64));
+            stg_offset += 16 * STG_BLOCK_LIMIT as u64;
+        }
+        let _ = write_index(
+            segmented.ind_entries,
+            segmented.group_offsets,
+            staged_entry_files,
+            segmented.staged_count,
+            file_ind,
+        )?;
+        Ok(())
+    })?;
     std::fs::remove_file(working_path)?;
     Ok(())
 }
 
-/// STEP 1: read .json.gz input array, rewrite as .ldjson.gz in smaller blocks (groups)
+/// STEP 0: train the compressor and create a dictionary which will be shared for all items
+fn get_zstd_dicts(file_input: File, dict_consumer: SyncSender<Result<Vec<u8>>>) -> Result<()> {
+    let mut input = MultiGzDecoder::new(file_input);
+    // Skip "[\n", then buffer starting from the first object / second line
+    let mut array_start_buf = [0u8; 2];
+    input.read_exact(&mut array_start_buf)?;
+    let mut input = BufReader::new(input);
+    let mut eof = false;
+    let reservoir_size = 200;
+
+    while !eof {
+        let mut reservoir = Vec::new();
+        for _ in 0..reservoir_size {
+            let mut line = Vec::new();
+            let got = input.read_until(b'\n', &mut line)?;
+            if got == 0 {
+                eof = true;
+                break;
+            }
+            reservoir.push(line);
+        }
+        let mut line_num = reservoir_size;
+        if !eof {
+            let mut line = Vec::new();
+            for _ in reservoir_size..ENTITIES_PER_CDICT {
+                let got = input.read_until(b'\n', &mut line)?;
+                if got == 0 {
+                    eof = true;
+                    break;
+                }
+                let i = rand::thread_rng().gen_range(0..=line_num);
+                if i < reservoir_size {
+                    std::mem::swap(&mut reservoir[i], &mut line);
+                }
+                line.clear();
+                line_num += 1;
+            }
+        }
+
+        let cdict_bytes = zstd::dict::from_samples(&reservoir, CDICT_SIZE)?;
+        dict_consumer.send(Ok(cdict_bytes)).unwrap();
+    }
+    Ok(())
+}
+
+/// STEP 1: read .json.gz input array, rewrite as .ldjson.zst
 ///         in memory + working file, keep (group, entity) indices keyed by Wikidata id_num
 ///          (Q42 -> 0x5100_0000_0000_002a)
 ///         in memory, keep the start byte offset of each block
 fn write_segmented(
     file_input: File,
     file_output: File,
+    file_output_dicts: File,
     file_en: File,
     file_stg: File,
     file_stg_secondary: File,
+    dict_supplier: Receiver<Result<Vec<u8>>>,
 ) -> Result<Segmented> {
     let mut input = MultiGzDecoder::new(file_input);
-    let mut output_plain = Some(file_output);
+    let mut output_plain = BufWriter::with_capacity(131072, file_output);
+    let mut output_dicts = BufWriter::with_capacity(131072, file_output_dicts);
     let mut output_en = BufWriter::with_capacity(131072, file_en);
     let mut file_stg = Some(file_stg);
     let mut file_stg_secondary = Some(file_stg_secondary);
@@ -270,42 +356,60 @@ fn write_segmented(
 
     let mut line = Vec::new();
     let mut eof = false;
-    let mut curr_group_offset = 0;
     let mut enwiki_count = 0;
-    let mut ind_entries: Vec<(u64, u64)> = vec![];
+    let mut ind_entries: Vec<(u64, u64, u32)> = vec![];
     let mut prop_ind_entries: Vec<(u64, u64)> = vec![];
-    let mut group_offsets = vec![];
     let mut staged_count: u64 = 0;
     let mut prop_staged_count: u64 = 0;
     let mut entity_number: u64 = 0;
+    let mut compressed_offset: u64 = 0;
+    let mut group_offsets = vec![];
+    let mut compressed_buf = Vec::with_capacity(1024 * 1024);
     let selectors = [
         Selector::new(vec![JsonPathItem::Key("id")]),
-        Selector::new(vec![JsonPathItem::Key("sitelinks"), JsonPathItem::Key("enwiki"), JsonPathItem::Key("title")]),
+        Selector::new(vec![
+            JsonPathItem::Key("sitelinks"),
+            JsonPathItem::Key("enwiki"),
+            JsonPathItem::Key("title"),
+        ]),
         Selector::new(vec![JsonPathItem::Key("claims")]),
     ];
+
     while !eof {
-        let mut output = ZstdEncoder::new(output_plain.take().unwrap(), 1)?;
-        output.multithread(1)?;
-        let next_group_start = entity_number + ENTITIES_PER_GROUP as u64;
-        while !eof && entity_number < next_group_start {
+        let next_group_start = entity_number + ENTITIES_PER_CDICT as u64;
+        let cdict_bytes = dict_supplier.recv().unwrap()?;
+        let cdict_size = cdict_bytes.len() as u32;
+        output_dicts.write_all(&cdict_size.to_be_bytes())?;
+        output_dicts.write_all(&cdict_bytes)?;
+        let cdict = EncoderDictionary::copy(&cdict_bytes, 3);
+        group_offsets.push(compressed_offset);
+
+        while entity_number < next_group_start {
             line.clear();
+            compressed_buf.clear();
             let got = input.read_until(b'\n', &mut line)?;
             if got == 0 {
                 eof = true;
                 break;
             }
-            let Some(json_str) = line.strip_suffix(b",\n") else { continue };
-            let (_, ent) = item_parser::parse_json::<VerboseError<&[u8]>>(json_str, &selectors).map_err(|err| {
-                eprintln!(
-                    "{:?}",
-                    err.map(|inner| inner
-                        .errors
-                        .into_iter()
-                        .map(|(i, k)| (std::str::from_utf8(i).unwrap_or_else(|_| "<non-utf8>"), k))
-                        .collect::<Vec<_>>())
-                );
-                ErrorKind::ParseJsonError
-            })?;
+            let Some(json_str) = line.strip_suffix(b",\n") else {
+                continue;
+            };
+            let (_, ent) = item_parser::parse_json::<VerboseError<&[u8]>>(json_str, &selectors)
+                .map_err(|err| {
+                    eprintln!(
+                        "{:?}",
+                        err.map(|inner| inner
+                            .errors
+                            .into_iter()
+                            .map(|(i, k)| (
+                                std::str::from_utf8(i).unwrap_or_else(|_| "<non-utf8>"),
+                                k
+                            ))
+                            .collect::<Vec<_>>())
+                    );
+                    ErrorKind::ParseJsonError
+                })?;
             let entity_kvs = match ent {
                 JsonValue::Object(kvs) => kvs,
                 _ => {
@@ -317,101 +421,103 @@ fn write_segmented(
             for (k, v) in entity_kvs {
                 match k.borrow() {
                     "id" => match v {
-                        JsonValue::Str(s) => {
-                            id_str = Some(s)
-                        },
+                        JsonValue::Str(s) => id_str = Some(s),
                         _ => {
                             return Err(ErrorKind::EntityError("id not a string").into());
                         }
-                    }
+                    },
                     "claims" => match v {
-                        JsonValue::Object(claim_kvs) => {
-                            claims = Some(claim_kvs)
-                        }
+                        JsonValue::Object(claim_kvs) => claims = Some(claim_kvs),
                         _ => {
                             return Err(ErrorKind::EntityError("id not a string").into());
                         }
-                    }
+                    },
                     "sitelinks" => match v {
                         JsonValue::Object(sitelinks_kvs) => {
-                            if let Some((_, JsonValue::Object(link_kvs))) = sitelinks_kvs.into_iter().find(|(k, _)| k == "enwiki") {
-                                if let Some((_, JsonValue::Str(title))) = link_kvs.into_iter().find(|(k, _)| k == "title") {
+                            if let Some((_, JsonValue::Object(link_kvs))) =
+                                sitelinks_kvs.into_iter().find(|(k, _)| k == "enwiki")
+                            {
+                                if let Some((_, JsonValue::Str(title))) =
+                                    link_kvs.into_iter().find(|(k, _)| k == "title")
+                                {
                                     writeln!(output_en, "{}\t{}", entity_number, title)?;
                                     enwiki_count += 1;
                                 }
                             }
                         }
-                        _ => {},
-                    }
-                    _ => {},
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
             let id_str = id_str.ok_or_else(|| ErrorKind::EntityError("missing id"))?;
             let (id_kind, id_num_str) = id_str.split_at(1);
             let id_num: u64 = id_num_str.parse()?;
             let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
-            output.write_all(json_str)?;
-            output.write_all(b"\n")?;
-            ind_entries.push((id, entity_number));
+            let mut enc = Compressor::with_prepared_dictionary(&cdict)?;
+            let csize = enc.compress_to_buffer(json_str.as_bytes(), &mut compressed_buf)?;
+            output_plain.write_all(&compressed_buf)?;
+            let csize_32 = csize
+                .try_into()
+                .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
+            ind_entries.push((id, compressed_offset, csize_32));
             for (prop_id_str, _) in claims.into_iter().flatten() {
                 let (id_kind, id_num_str) = prop_id_str.split_at(1);
                 let id_num: u64 = id_num_str.parse()?;
                 let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
                 prop_ind_entries.push((id, entity_number));
             }
+            compressed_offset += csize as u64;
             entity_number += 1;
+            if entity_number % 1000 == 0 {
+                eprint!(
+                    "\r\x1b[K{:>12}\t{:>12}\t{:>8}",
+                    prop_staged_count + prop_ind_entries.len() as u64,
+                    staged_count + ind_entries.len() as u64,
+                    enwiki_count
+                );
+            }
         }
-        if ind_entries.len() >= STG_BLOCK_LIMIT {
+        if !eof && ind_entries.len() >= STG_BLOCK_LIMIT {
             let block = &mut ind_entries[0..STG_BLOCK_LIMIT];
             block.sort_by_key(|e| e.0);
 
             let mut output_stg = BufWriter::with_capacity(131072, file_stg.take().unwrap());
-            for (k, eidx) in ind_entries.drain(0..STG_BLOCK_LIMIT) {
+            for (k, offset, length) in ind_entries.drain(0..STG_BLOCK_LIMIT) {
                 output_stg.write_all(&k.to_be_bytes())?;
-                output_stg.write_all(&eidx.to_be_bytes())?;
+                output_stg.write_all(&offset.to_be_bytes())?;
+                output_stg.write_all(&length.to_be_bytes())?;
             }
             staged_count += STG_BLOCK_LIMIT as u64;
             let _ = file_stg.insert(output_stg.into_inner().map_err(std::io::Error::from)?);
         }
-        while prop_ind_entries.len() >= STG_BLOCK_LIMIT {
-            let block = &mut prop_ind_entries[0..STG_BLOCK_LIMIT];
+        let prop_write = if eof {
+            // TODO: remove when create_index_secondary is implemented
+            prop_ind_entries.len()
+        } else if prop_ind_entries.len() >= STG_BLOCK_LIMIT {
+            STG_BLOCK_LIMIT
+        } else {
+            0
+        };
+        if prop_write > 0 {
+            let block = &mut prop_ind_entries[0..prop_write];
             block.sort();
 
-            let mut output_stg_secondary = BufWriter::with_capacity(131072, file_stg_secondary.take().unwrap());
-            for (k, eidx) in prop_ind_entries.drain(0..STG_BLOCK_LIMIT) {
+            let mut output_stg_secondary =
+                BufWriter::with_capacity(131072, file_stg_secondary.take().unwrap());
+            for (k, eidx) in prop_ind_entries.drain(0..prop_write) {
                 output_stg_secondary.write_all(&k.to_be_bytes())?;
                 output_stg_secondary.write_all(&eidx.to_be_bytes())?;
             }
             prop_staged_count += STG_BLOCK_LIMIT as u64;
-            let _ = file_stg_secondary.insert(output_stg_secondary.into_inner().map_err(std::io::Error::from)?);
+            let _ = file_stg_secondary.insert(
+                output_stg_secondary
+                    .into_inner()
+                    .map_err(std::io::Error::from)?,
+            );
         }
-
-        group_offsets.push(curr_group_offset);
-        eprint!(
-            "\r\x1b[K{:>12}\t{:>12}\t{:>8}",
-            prop_staged_count + prop_ind_entries.len() as u64,
-            staged_count + ind_entries.len() as u64,
-            enwiki_count
-        );
-        let mut output_flushed = output.finish()?;
-        // output_flushed.flush()?;
-        curr_group_offset = output_flushed.stream_position()?;
-        let _ = output_plain.insert(output_flushed);
     }
     output_en.flush()?;
-    {
-        // TODO: remove when create_index_secondary is implemented
-        let block = &mut prop_ind_entries[..];
-        block.sort();
-
-        let mut output_stg_secondary = BufWriter::with_capacity(131072, file_stg_secondary.take().unwrap());
-        for (k, eidx) in prop_ind_entries.drain(..) {
-            output_stg_secondary.write_all(&k.to_be_bytes())?;
-            output_stg_secondary.write_all(&eidx.to_be_bytes())?;
-        }
-        prop_staged_count += STG_BLOCK_LIMIT as u64;
-        let _ = file_stg_secondary.insert(output_stg_secondary.into_inner().map_err(std::io::Error::from)?);
-    }
 
     Ok(Segmented {
         group_offsets,
@@ -431,7 +537,7 @@ fn write_segmented(
 /// level _ = nodes [(width=W, [W-1] keys, [W] ptrs)] | N                                  N
 ///           where 128 <= W <= 256                     :'--------.---------.---[W times]# :
 ///                                                     :         :         :            # :
-/// level N = leaves [(key, group, entity)]           | L-L-L-L # L-L-L-L # L-L- etc     # L etc
+/// level N = leaves [(key, entity_start)]            | L-L-L-L # L-L-L-L # L-L- etc     # L etc
 /// ```
 ///
 /// the key of a node is the minimum/leftmost leaf key reachable from it
@@ -448,7 +554,7 @@ fn write_segmented(
 /// at level N, the leaf block reached contains all valid keys in the interval indicated
 /// by its referencing pointer in level N-1
 pub fn write_index<R: Read, W: Write + Seek>(
-    mut entries: Vec<(u64, u64)>,
+    mut entries: Vec<(u64, u64, u32)>,
     group_offsets: Vec<u64>,
     staged_entry_files: Vec<R>,
     staged_count: u64,
@@ -472,14 +578,15 @@ pub fn write_index<R: Read, W: Write + Seek>(
     // STEP 2b: write header, then write placeholders for all levels of the tree except
     //          the last.
     let mut offset: u64 = 0;
-    output.write_all(&group_offsets.len().to_be_bytes())?;
+    let n_groups = group_offsets.len();
+    output.write_all(&u64::to_be_bytes(n_groups as u64))?;
     offset += 8;
     for v in group_offsets.iter() {
         output.write_all(&v.to_be_bytes())?;
         offset += 8;
     }
     let n_levels = level_descriptions.len();
-    output.write_all(&n_levels.to_be_bytes())?;
+    output.write_all(&u64::to_be_bytes(n_levels as u64))?;
     offset += 8;
     let mut level_offsets = vec![];
     for ld in level_descriptions[0..n_levels - 1].iter() {
@@ -494,7 +601,7 @@ pub fn write_index<R: Read, W: Write + Seek>(
     // STEP 2c: merge sort the in-memory and staging node-list chunks to form the
     //           last (leaf) level of the B+tree.
     //          save the keys and offsets of leaves which begin a leaf block
-    let mut readers: Vec<&mut dyn Iterator<Item = std::io::Result<(u64, u64)>>> = vec![];
+    let mut readers: Vec<&mut dyn Iterator<Item = std::io::Result<(u64, u64, u32)>>> = vec![];
     entries.sort_by_key(|e| e.0);
     let mut entries_iter = entries.iter().copied().map(Ok);
     let mut disk_readers: Vec<_> = staged_entry_files.into_iter().map(DiskIter::new).collect();
@@ -522,7 +629,8 @@ pub fn write_index<R: Read, W: Write + Seek>(
         }
         output.write_all(&item.0.to_be_bytes())?;
         output.write_all(&item.1.to_be_bytes())?;
-        offset += 16;
+        output.write_all(&item.2.to_be_bytes())?;
+        offset += 20;
         ind_size += 1;
 
         if let Some(item_res) = readers[i].next() {
@@ -640,41 +748,109 @@ mod tests {
         }
     }
 
+    struct IndexReader<'a> {
+        data: &'a [u8],
+    }
+
+    impl<'a> IndexReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Self { data }
+        }
+
+        fn be_to_u64(src: &[u8]) -> u64 {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(src);
+            u64::from_be_bytes(buf)
+        }
+
+        fn be_to_leafdata(src: &[u8]) -> (u64, u64, u32) {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&src[..8]);
+            let a = u64::from_be_bytes(buf);
+            buf.copy_from_slice(&src[8..16]);
+            let b = u64::from_be_bytes(buf);
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&src[16..]);
+            (a, b, u32::from_be_bytes(buf))
+        }
+
+        fn n_groups(&self) -> u64 {
+            Self::be_to_u64(&self.data[..8])
+        }
+
+        fn group_offsets(&self, n_groups: u64) -> Vec<u64> {
+            self.data[8..]
+                .chunks_exact(8)
+                .map(Self::be_to_u64)
+                .take(n_groups as usize)
+                .collect()
+        }
+
+        fn root_node_pos(&self, n_groups: u64) -> u64 {
+            // n_groups, group_offsets, n_levels
+            8 + 8 * n_groups + 8
+        }
+
+        fn node_level(&self, pos: u64, n_nodes: u64) -> (Vec<u64>, u64, u64) {
+            let mut base = pos as usize;
+            let mut res = vec![];
+            let mut n_ptrs = 0;
+            for _ in 0..n_nodes {
+                let w = Self::be_to_u64(&self.data[base..base + 8]);
+                n_ptrs += w;
+                let w = w as usize;
+                res.extend(
+                    self.data[base..]
+                        .chunks_exact(8)
+                        .map(Self::be_to_u64)
+                        .take(2 * w),
+                );
+                base += 16 * w;
+            }
+            (res, base as u64, n_ptrs)
+        }
+
+        fn leaf_level(&self, pos: u64) -> Vec<(u64, u64, u32)> {
+            let base = pos as usize;
+            self.data[base..]
+                .chunks_exact(20)
+                .map(Self::be_to_leafdata)
+                .collect()
+        }
+    }
+
     #[test]
     #[rustfmt::skip]
     fn write_index_one_level() -> super::Result<()> {
-        let ind_entries = (1u64..=20).map(|k| (k, k + 64)).collect();
+        let ind_entries = (1u64..=20).map(|k| (k, k + 64, 1u32)).collect();
         let group_offsets = vec![0, 1000, 2000, 3000];
         let staged_entry_files: Vec<std::fs::File> = vec![];
         let actual = super::write_index(ind_entries, group_offsets, staged_entry_files, 0, SeekableVec::default())?;
-        let actual64: Vec<_> = actual.inner.chunks_exact(8).map(|c| {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(c);
-            u64::from_be_bytes(b)
-        }).collect();
-        assert_eq!(actual64, vec![
-            4, 0, 1000, 2000, 3000,
-            1,
-            1, 0x41,
-            2, 0x42,
-            3, 0x43,
-            4, 0x44,
-            5, 0x45,
-            6, 0x46,
-            7, 0x47,
-            8, 0x48,
-            9, 0x49,
-            10, 0x4a,
-            11, 0x4b,
-            12, 0x4c,
-            13, 0x4d,
-            14, 0x4e,
-            15, 0x4f,
-            16, 0x50,
-            17, 0x51,
-            18, 0x52,
-            19, 0x53,
-            20, 0x54,
+        let ir = IndexReader::new(&actual.inner);
+        let n_groups = ir.n_groups();
+        assert_eq!(n_groups, 4);
+        assert_eq!(ir.group_offsets(n_groups), vec![0, 1000, 2000, 3000]);
+        assert_eq!(ir.leaf_level(ir.root_node_pos(n_groups)), vec![
+            (1, 0x41, 1),
+            (2, 0x42, 1),
+            (3, 0x43, 1),
+            (4, 0x44, 1),
+            (5, 0x45, 1),
+            (6, 0x46, 1),
+            (7, 0x47, 1),
+            (8, 0x48, 1),
+            (9, 0x49, 1),
+            (10, 0x4a, 1),
+            (11, 0x4b, 1),
+            (12, 0x4c, 1),
+            (13, 0x4d, 1),
+            (14, 0x4e, 1),
+            (15, 0x4f, 1),
+            (16, 0x50, 1),
+            (17, 0x51, 1),
+            (18, 0x52, 1),
+            (19, 0x53, 1),
+            (20, 0x54, 1),
         ]);
         Ok(())
     }
@@ -682,58 +858,55 @@ mod tests {
     #[test]
     #[rustfmt::skip]
     fn write_index_two_levels() -> super::Result<()> {
-        let ind_entries = (1u64..=601).map(|k| (k, k + 64)).collect();
+        let ind_entries = (1u64..=601).map(|k| (k, k + 64, 1u32)).collect();
         let group_offsets = vec![0, 1000, 2000, 3000];
         let staged_entry_files: Vec<std::fs::File> = vec![];
         let actual = super::write_index(ind_entries, group_offsets, staged_entry_files, 0, SeekableVec::default())?;
-        let actual64: Vec<_> = actual.inner.chunks_exact(8).map(|c| {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(c);
-            u64::from_be_bytes(b)
-        }).collect();
-        assert_eq!(actual64, vec![
-            4, 0, 1000, 2000, 3000,
-            2,
-            3, 257, 430, 0x60, 0x1060, (0x60 + 429*16),
-            // offset = (1+4+1+6)*8 = 0x60
-            1  , 0x41, 2  , 0x42, 3  , 0x43, 4  , 0x44, 5  , 0x45, 6  , 0x46, 7  , 0x47, 8  , 0x48, 9  , 0x49, 10 , 0x4a, 11 , 0x4b, 12 , 0x4c, 13 , 0x4d, 14 , 0x4e, 15 , 0x4f, 16 , 0x50,
-            17 , 0x51, 18 , 0x52, 19 , 0x53, 20 , 0x54, 21 , 0x55, 22 , 0x56, 23 , 0x57, 24 , 0x58, 25 , 0x59, 26 , 0x5a, 27 , 0x5b, 28 , 0x5c, 29 , 0x5d, 30 , 0x5e, 31 , 0x5f, 32 , 0x60,
-            33 , 0x61, 34 , 0x62, 35 , 0x63, 36 , 0x64, 37 , 0x65, 38 , 0x66, 39 , 0x67, 40 , 0x68, 41 , 0x69, 42 , 0x6a, 43 , 0x6b, 44 , 0x6c, 45 , 0x6d, 46 , 0x6e, 47 , 0x6f, 48 , 0x70,
-            49 , 0x71, 50 , 0x72, 51 , 0x73, 52 , 0x74, 53 , 0x75, 54 , 0x76, 55 , 0x77, 56 , 0x78, 57 , 0x79, 58 , 0x7a, 59 , 0x7b, 60 , 0x7c, 61 , 0x7d, 62 , 0x7e, 63 , 0x7f, 64 , 0x80,
-            65 , 0x81, 66 , 0x82, 67 , 0x83, 68 , 0x84, 69 , 0x85, 70 , 0x86, 71 , 0x87, 72 , 0x88, 73 , 0x89, 74 , 0x8a, 75 , 0x8b, 76 , 0x8c, 77 , 0x8d, 78 , 0x8e, 79 , 0x8f, 80 , 0x90,
-            81 , 0x91, 82 , 0x92, 83 , 0x93, 84 , 0x94, 85 , 0x95, 86 , 0x96, 87 , 0x97, 88 , 0x98, 89 , 0x99, 90 , 0x9a, 91 , 0x9b, 92 , 0x9c, 93 , 0x9d, 94 , 0x9e, 95 , 0x9f, 96 , 0xa0,
-            97 , 0xa1, 98 , 0xa2, 99 , 0xa3, 100, 0xa4, 101, 0xa5, 102, 0xa6, 103, 0xa7, 104, 0xa8, 105, 0xa9, 106, 0xaa, 107, 0xab, 108, 0xac, 109, 0xad, 110, 0xae, 111, 0xaf, 112, 0xb0,
-            113, 0xb1, 114, 0xb2, 115, 0xb3, 116, 0xb4, 117, 0xb5, 118, 0xb6, 119, 0xb7, 120, 0xb8, 121, 0xb9, 122, 0xba, 123, 0xbb, 124, 0xbc, 125, 0xbd, 126, 0xbe, 127, 0xbf, 128, 0xc0,
-            129, 0xc1, 130, 0xc2, 131, 0xc3, 132, 0xc4, 133, 0xc5, 134, 0xc6, 135, 0xc7, 136, 0xc8, 137, 0xc9, 138, 0xca, 139, 0xcb, 140, 0xcc, 141, 0xcd, 142, 0xce, 143, 0xcf, 144, 0xd0,
-            145, 0xd1, 146, 0xd2, 147, 0xd3, 148, 0xd4, 149, 0xd5, 150, 0xd6, 151, 0xd7, 152, 0xd8, 153, 0xd9, 154, 0xda, 155, 0xdb, 156, 0xdc, 157, 0xdd, 158, 0xde, 159, 0xdf, 160, 0xe0,
-            161, 0xe1, 162, 0xe2, 163, 0xe3, 164, 0xe4, 165, 0xe5, 166, 0xe6, 167, 0xe7, 168, 0xe8, 169, 0xe9, 170, 0xea, 171, 0xeb, 172, 0xec, 173, 0xed, 174, 0xee, 175, 0xef, 176, 0xf0,
-            177, 0xf1, 178, 0xf2, 179, 0xf3, 180, 0xf4, 181, 0xf5, 182, 0xf6, 183, 0xf7, 184, 0xf8, 185, 0xf9, 186, 0xfa, 187, 0xfb, 188, 0xfc, 189, 0xfd, 190, 0xfe, 191, 0xff, 192, 0x100,
-            193, 0x101, 194, 0x102, 195, 0x103, 196, 0x104, 197, 0x105, 198, 0x106, 199, 0x107, 200, 0x108, 201, 0x109, 202, 0x10a, 203, 0x10b, 204, 0x10c, 205, 0x10d, 206, 0x10e, 207, 0x10f, 208, 0x110,
-            209, 0x111, 210, 0x112, 211, 0x113, 212, 0x114, 213, 0x115, 214, 0x116, 215, 0x117, 216, 0x118, 217, 0x119, 218, 0x11a, 219, 0x11b, 220, 0x11c, 221, 0x11d, 222, 0x11e, 223, 0x11f, 224, 0x120,
-            225, 0x121, 226, 0x122, 227, 0x123, 228, 0x124, 229, 0x125, 230, 0x126, 231, 0x127, 232, 0x128, 233, 0x129, 234, 0x12a, 235, 0x12b, 236, 0x12c, 237, 0x12d, 238, 0x12e, 239, 0x12f, 240, 0x130,
-            241, 0x131, 242, 0x132, 243, 0x133, 244, 0x134, 245, 0x135, 246, 0x136, 247, 0x137, 248, 0x138, 249, 0x139, 250, 0x13a, 251, 0x13b, 252, 0x13c, 253, 0x13d, 254, 0x13e, 255, 0x13f, 256, 0x140,
-            257, 0x141, 258, 0x142, 259, 0x143, 260, 0x144, 261, 0x145, 262, 0x146, 263, 0x147, 264, 0x148, 265, 0x149, 266, 0x14a, 267, 0x14b, 268, 0x14c, 269, 0x14d, 270, 0x14e, 271, 0x14f, 272, 0x150,
-            273, 0x151, 274, 0x152, 275, 0x153, 276, 0x154, 277, 0x155, 278, 0x156, 279, 0x157, 280, 0x158, 281, 0x159, 282, 0x15a, 283, 0x15b, 284, 0x15c, 285, 0x15d, 286, 0x15e, 287, 0x15f, 288, 0x160,
-            289, 0x161, 290, 0x162, 291, 0x163, 292, 0x164, 293, 0x165, 294, 0x166, 295, 0x167, 296, 0x168, 297, 0x169, 298, 0x16a, 299, 0x16b, 300, 0x16c, 301, 0x16d, 302, 0x16e, 303, 0x16f, 304, 0x170,
-            305, 0x171, 306, 0x172, 307, 0x173, 308, 0x174, 309, 0x175, 310, 0x176, 311, 0x177, 312, 0x178, 313, 0x179, 314, 0x17a, 315, 0x17b, 316, 0x17c, 317, 0x17d, 318, 0x17e, 319, 0x17f, 320, 0x180,
-            321, 0x181, 322, 0x182, 323, 0x183, 324, 0x184, 325, 0x185, 326, 0x186, 327, 0x187, 328, 0x188, 329, 0x189, 330, 0x18a, 331, 0x18b, 332, 0x18c, 333, 0x18d, 334, 0x18e, 335, 0x18f, 336, 0x190,
-            337, 0x191, 338, 0x192, 339, 0x193, 340, 0x194, 341, 0x195, 342, 0x196, 343, 0x197, 344, 0x198, 345, 0x199, 346, 0x19a, 347, 0x19b, 348, 0x19c, 349, 0x19d, 350, 0x19e, 351, 0x19f, 352, 0x1a0,
-            353, 0x1a1, 354, 0x1a2, 355, 0x1a3, 356, 0x1a4, 357, 0x1a5, 358, 0x1a6, 359, 0x1a7, 360, 0x1a8, 361, 0x1a9, 362, 0x1aa, 363, 0x1ab, 364, 0x1ac, 365, 0x1ad, 366, 0x1ae, 367, 0x1af, 368, 0x1b0,
-            369, 0x1b1, 370, 0x1b2, 371, 0x1b3, 372, 0x1b4, 373, 0x1b5, 374, 0x1b6, 375, 0x1b7, 376, 0x1b8, 377, 0x1b9, 378, 0x1ba, 379, 0x1bb, 380, 0x1bc, 381, 0x1bd, 382, 0x1be, 383, 0x1bf, 384, 0x1c0,
-            385, 0x1c1, 386, 0x1c2, 387, 0x1c3, 388, 0x1c4, 389, 0x1c5, 390, 0x1c6, 391, 0x1c7, 392, 0x1c8, 393, 0x1c9, 394, 0x1ca, 395, 0x1cb, 396, 0x1cc, 397, 0x1cd, 398, 0x1ce, 399, 0x1cf, 400, 0x1d0,
-            401, 0x1d1, 402, 0x1d2, 403, 0x1d3, 404, 0x1d4, 405, 0x1d5, 406, 0x1d6, 407, 0x1d7, 408, 0x1d8, 409, 0x1d9, 410, 0x1da, 411, 0x1db, 412, 0x1dc, 413, 0x1dd, 414, 0x1de, 415, 0x1df, 416, 0x1e0,
-            417, 0x1e1, 418, 0x1e2, 419, 0x1e3, 420, 0x1e4, 421, 0x1e5, 422, 0x1e6, 423, 0x1e7, 424, 0x1e8, 425, 0x1e9, 426, 0x1ea, 427, 0x1eb, 428, 0x1ec, 429, 0x1ed, 430, 0x1ee, 431, 0x1ef, 432, 0x1f0,
-            433, 0x1f1, 434, 0x1f2, 435, 0x1f3, 436, 0x1f4, 437, 0x1f5, 438, 0x1f6, 439, 0x1f7, 440, 0x1f8, 441, 0x1f9, 442, 0x1fa, 443, 0x1fb, 444, 0x1fc, 445, 0x1fd, 446, 0x1fe, 447, 0x1ff, 448, 0x200,
-            449, 0x201, 450, 0x202, 451, 0x203, 452, 0x204, 453, 0x205, 454, 0x206, 455, 0x207, 456, 0x208, 457, 0x209, 458, 0x20a, 459, 0x20b, 460, 0x20c, 461, 0x20d, 462, 0x20e, 463, 0x20f, 464, 0x210,
-            465, 0x211, 466, 0x212, 467, 0x213, 468, 0x214, 469, 0x215, 470, 0x216, 471, 0x217, 472, 0x218, 473, 0x219, 474, 0x21a, 475, 0x21b, 476, 0x21c, 477, 0x21d, 478, 0x21e, 479, 0x21f, 480, 0x220,
-            481, 0x221, 482, 0x222, 483, 0x223, 484, 0x224, 485, 0x225, 486, 0x226, 487, 0x227, 488, 0x228, 489, 0x229, 490, 0x22a, 491, 0x22b, 492, 0x22c, 493, 0x22d, 494, 0x22e, 495, 0x22f, 496, 0x230,
-            497, 0x231, 498, 0x232, 499, 0x233, 500, 0x234, 501, 0x235, 502, 0x236, 503, 0x237, 504, 0x238, 505, 0x239, 506, 0x23a, 507, 0x23b, 508, 0x23c, 509, 0x23d, 510, 0x23e, 511, 0x23f, 512, 0x240,
-            513, 0x241, 514, 0x242, 515, 0x243, 516, 0x244, 517, 0x245, 518, 0x246, 519, 0x247, 520, 0x248, 521, 0x249, 522, 0x24a, 523, 0x24b, 524, 0x24c, 525, 0x24d, 526, 0x24e, 527, 0x24f, 528, 0x250,
-            529, 0x251, 530, 0x252, 531, 0x253, 532, 0x254, 533, 0x255, 534, 0x256, 535, 0x257, 536, 0x258, 537, 0x259, 538, 0x25a, 539, 0x25b, 540, 0x25c, 541, 0x25d, 542, 0x25e, 543, 0x25f, 544, 0x260,
-            545, 0x261, 546, 0x262, 547, 0x263, 548, 0x264, 549, 0x265, 550, 0x266, 551, 0x267, 552, 0x268, 553, 0x269, 554, 0x26a, 555, 0x26b, 556, 0x26c, 557, 0x26d, 558, 0x26e, 559, 0x26f, 560, 0x270,
-            561, 0x271, 562, 0x272, 563, 0x273, 564, 0x274, 565, 0x275, 566, 0x276, 567, 0x277, 568, 0x278, 569, 0x279, 570, 0x27a, 571, 0x27b, 572, 0x27c, 573, 0x27d, 574, 0x27e, 575, 0x27f, 576, 0x280,
-            577, 0x281, 578, 0x282, 579, 0x283, 580, 0x284, 581, 0x285, 582, 0x286, 583, 0x287, 584, 0x288, 585, 0x289, 586, 0x28a, 587, 0x28b, 588, 0x28c, 589, 0x28d, 590, 0x28e, 591, 0x28f, 592, 0x290,
-            593, 0x291, 594, 0x292, 595, 0x293, 596, 0x294, 597, 0x295, 598, 0x296, 599, 0x297, 600, 0x298, 601, 0x299,
+        let ir = IndexReader::new(&actual.inner);
+        let n_groups = ir.n_groups();
+        assert_eq!(n_groups, 4);
+        assert_eq!(ir.group_offsets(n_groups), vec![0, 1000, 2000, 3000]);
+        let (node_level, leaf_level_pos, _) = ir.node_level(ir.root_node_pos(n_groups), 1);
+        assert_eq!(node_level, vec![3, 257, 430, 0x60, (0x60 + 256*20), (0x60 + 429*20)]);
+        assert_eq!(ir.leaf_level(leaf_level_pos), vec![
+            (  1,  0x41, 1), (  2,  0x42, 1), (  3,  0x43, 1), (  4,  0x44, 1), (  5,  0x45, 1), (  6,  0x46, 1), (  7,  0x47, 1), (  8,  0x48, 1), (  9,  0x49, 1), ( 10,  0x4a, 1), ( 11,  0x4b, 1), ( 12,  0x4c, 1), ( 13,  0x4d, 1), ( 14,  0x4e, 1), ( 15,  0x4f, 1), ( 16,  0x50, 1),
+            ( 17,  0x51, 1), ( 18,  0x52, 1), ( 19,  0x53, 1), ( 20,  0x54, 1), ( 21,  0x55, 1), ( 22,  0x56, 1), ( 23,  0x57, 1), ( 24,  0x58, 1), ( 25,  0x59, 1), ( 26,  0x5a, 1), ( 27,  0x5b, 1), ( 28,  0x5c, 1), ( 29,  0x5d, 1), ( 30,  0x5e, 1), ( 31,  0x5f, 1), ( 32,  0x60, 1),
+            ( 33,  0x61, 1), ( 34,  0x62, 1), ( 35,  0x63, 1), ( 36,  0x64, 1), ( 37,  0x65, 1), ( 38,  0x66, 1), ( 39,  0x67, 1), ( 40,  0x68, 1), ( 41,  0x69, 1), ( 42,  0x6a, 1), ( 43,  0x6b, 1), ( 44,  0x6c, 1), ( 45,  0x6d, 1), ( 46,  0x6e, 1), ( 47,  0x6f, 1), ( 48,  0x70, 1),
+            ( 49,  0x71, 1), ( 50,  0x72, 1), ( 51,  0x73, 1), ( 52,  0x74, 1), ( 53,  0x75, 1), ( 54,  0x76, 1), ( 55,  0x77, 1), ( 56,  0x78, 1), ( 57,  0x79, 1), ( 58,  0x7a, 1), ( 59,  0x7b, 1), ( 60,  0x7c, 1), ( 61,  0x7d, 1), ( 62,  0x7e, 1), ( 63,  0x7f, 1), ( 64,  0x80, 1),
+            ( 65,  0x81, 1), ( 66,  0x82, 1), ( 67,  0x83, 1), ( 68,  0x84, 1), ( 69,  0x85, 1), ( 70,  0x86, 1), ( 71,  0x87, 1), ( 72,  0x88, 1), ( 73,  0x89, 1), ( 74,  0x8a, 1), ( 75,  0x8b, 1), ( 76,  0x8c, 1), ( 77,  0x8d, 1), ( 78,  0x8e, 1), ( 79,  0x8f, 1), ( 80,  0x90, 1),
+            ( 81,  0x91, 1), ( 82,  0x92, 1), ( 83,  0x93, 1), ( 84,  0x94, 1), ( 85,  0x95, 1), ( 86,  0x96, 1), ( 87,  0x97, 1), ( 88,  0x98, 1), ( 89,  0x99, 1), ( 90,  0x9a, 1), ( 91,  0x9b, 1), ( 92,  0x9c, 1), ( 93,  0x9d, 1), ( 94,  0x9e, 1), ( 95,  0x9f, 1), ( 96,  0xa0, 1),
+            ( 97,  0xa1, 1), ( 98,  0xa2, 1), ( 99,  0xa3, 1), (100,  0xa4, 1), (101,  0xa5, 1), (102,  0xa6, 1), (103,  0xa7, 1), (104,  0xa8, 1), (105,  0xa9, 1), (106,  0xaa, 1), (107,  0xab, 1), (108,  0xac, 1), (109,  0xad, 1), (110,  0xae, 1), (111,  0xaf, 1), (112,  0xb0, 1),
+            (113,  0xb1, 1), (114,  0xb2, 1), (115,  0xb3, 1), (116,  0xb4, 1), (117,  0xb5, 1), (118,  0xb6, 1), (119,  0xb7, 1), (120,  0xb8, 1), (121,  0xb9, 1), (122,  0xba, 1), (123,  0xbb, 1), (124,  0xbc, 1), (125,  0xbd, 1), (126,  0xbe, 1), (127,  0xbf, 1), (128,  0xc0, 1),
+            (129,  0xc1, 1), (130,  0xc2, 1), (131,  0xc3, 1), (132,  0xc4, 1), (133,  0xc5, 1), (134,  0xc6, 1), (135,  0xc7, 1), (136,  0xc8, 1), (137,  0xc9, 1), (138,  0xca, 1), (139,  0xcb, 1), (140,  0xcc, 1), (141,  0xcd, 1), (142,  0xce, 1), (143,  0xcf, 1), (144,  0xd0, 1),
+            (145,  0xd1, 1), (146,  0xd2, 1), (147,  0xd3, 1), (148,  0xd4, 1), (149,  0xd5, 1), (150,  0xd6, 1), (151,  0xd7, 1), (152,  0xd8, 1), (153,  0xd9, 1), (154,  0xda, 1), (155,  0xdb, 1), (156,  0xdc, 1), (157,  0xdd, 1), (158,  0xde, 1), (159,  0xdf, 1), (160,  0xe0, 1),
+            (161,  0xe1, 1), (162,  0xe2, 1), (163,  0xe3, 1), (164,  0xe4, 1), (165,  0xe5, 1), (166,  0xe6, 1), (167,  0xe7, 1), (168,  0xe8, 1), (169,  0xe9, 1), (170,  0xea, 1), (171,  0xeb, 1), (172,  0xec, 1), (173,  0xed, 1), (174,  0xee, 1), (175,  0xef, 1), (176,  0xf0, 1),
+            (177,  0xf1, 1), (178,  0xf2, 1), (179,  0xf3, 1), (180,  0xf4, 1), (181,  0xf5, 1), (182,  0xf6, 1), (183,  0xf7, 1), (184,  0xf8, 1), (185,  0xf9, 1), (186,  0xfa, 1), (187,  0xfb, 1), (188,  0xfc, 1), (189,  0xfd, 1), (190,  0xfe, 1), (191,  0xff, 1), (192, 0x100, 1),
+            (193, 0x101, 1), (194, 0x102, 1), (195, 0x103, 1), (196, 0x104, 1), (197, 0x105, 1), (198, 0x106, 1), (199, 0x107, 1), (200, 0x108, 1), (201, 0x109, 1), (202, 0x10a, 1), (203, 0x10b, 1), (204, 0x10c, 1), (205, 0x10d, 1), (206, 0x10e, 1), (207, 0x10f, 1), (208, 0x110, 1),
+            (209, 0x111, 1), (210, 0x112, 1), (211, 0x113, 1), (212, 0x114, 1), (213, 0x115, 1), (214, 0x116, 1), (215, 0x117, 1), (216, 0x118, 1), (217, 0x119, 1), (218, 0x11a, 1), (219, 0x11b, 1), (220, 0x11c, 1), (221, 0x11d, 1), (222, 0x11e, 1), (223, 0x11f, 1), (224, 0x120, 1),
+            (225, 0x121, 1), (226, 0x122, 1), (227, 0x123, 1), (228, 0x124, 1), (229, 0x125, 1), (230, 0x126, 1), (231, 0x127, 1), (232, 0x128, 1), (233, 0x129, 1), (234, 0x12a, 1), (235, 0x12b, 1), (236, 0x12c, 1), (237, 0x12d, 1), (238, 0x12e, 1), (239, 0x12f, 1), (240, 0x130, 1),
+            (241, 0x131, 1), (242, 0x132, 1), (243, 0x133, 1), (244, 0x134, 1), (245, 0x135, 1), (246, 0x136, 1), (247, 0x137, 1), (248, 0x138, 1), (249, 0x139, 1), (250, 0x13a, 1), (251, 0x13b, 1), (252, 0x13c, 1), (253, 0x13d, 1), (254, 0x13e, 1), (255, 0x13f, 1), (256, 0x140, 1),
+            (257, 0x141, 1), (258, 0x142, 1), (259, 0x143, 1), (260, 0x144, 1), (261, 0x145, 1), (262, 0x146, 1), (263, 0x147, 1), (264, 0x148, 1), (265, 0x149, 1), (266, 0x14a, 1), (267, 0x14b, 1), (268, 0x14c, 1), (269, 0x14d, 1), (270, 0x14e, 1), (271, 0x14f, 1), (272, 0x150, 1),
+            (273, 0x151, 1), (274, 0x152, 1), (275, 0x153, 1), (276, 0x154, 1), (277, 0x155, 1), (278, 0x156, 1), (279, 0x157, 1), (280, 0x158, 1), (281, 0x159, 1), (282, 0x15a, 1), (283, 0x15b, 1), (284, 0x15c, 1), (285, 0x15d, 1), (286, 0x15e, 1), (287, 0x15f, 1), (288, 0x160, 1),
+            (289, 0x161, 1), (290, 0x162, 1), (291, 0x163, 1), (292, 0x164, 1), (293, 0x165, 1), (294, 0x166, 1), (295, 0x167, 1), (296, 0x168, 1), (297, 0x169, 1), (298, 0x16a, 1), (299, 0x16b, 1), (300, 0x16c, 1), (301, 0x16d, 1), (302, 0x16e, 1), (303, 0x16f, 1), (304, 0x170, 1),
+            (305, 0x171, 1), (306, 0x172, 1), (307, 0x173, 1), (308, 0x174, 1), (309, 0x175, 1), (310, 0x176, 1), (311, 0x177, 1), (312, 0x178, 1), (313, 0x179, 1), (314, 0x17a, 1), (315, 0x17b, 1), (316, 0x17c, 1), (317, 0x17d, 1), (318, 0x17e, 1), (319, 0x17f, 1), (320, 0x180, 1),
+            (321, 0x181, 1), (322, 0x182, 1), (323, 0x183, 1), (324, 0x184, 1), (325, 0x185, 1), (326, 0x186, 1), (327, 0x187, 1), (328, 0x188, 1), (329, 0x189, 1), (330, 0x18a, 1), (331, 0x18b, 1), (332, 0x18c, 1), (333, 0x18d, 1), (334, 0x18e, 1), (335, 0x18f, 1), (336, 0x190, 1),
+            (337, 0x191, 1), (338, 0x192, 1), (339, 0x193, 1), (340, 0x194, 1), (341, 0x195, 1), (342, 0x196, 1), (343, 0x197, 1), (344, 0x198, 1), (345, 0x199, 1), (346, 0x19a, 1), (347, 0x19b, 1), (348, 0x19c, 1), (349, 0x19d, 1), (350, 0x19e, 1), (351, 0x19f, 1), (352, 0x1a0, 1),
+            (353, 0x1a1, 1), (354, 0x1a2, 1), (355, 0x1a3, 1), (356, 0x1a4, 1), (357, 0x1a5, 1), (358, 0x1a6, 1), (359, 0x1a7, 1), (360, 0x1a8, 1), (361, 0x1a9, 1), (362, 0x1aa, 1), (363, 0x1ab, 1), (364, 0x1ac, 1), (365, 0x1ad, 1), (366, 0x1ae, 1), (367, 0x1af, 1), (368, 0x1b0, 1),
+            (369, 0x1b1, 1), (370, 0x1b2, 1), (371, 0x1b3, 1), (372, 0x1b4, 1), (373, 0x1b5, 1), (374, 0x1b6, 1), (375, 0x1b7, 1), (376, 0x1b8, 1), (377, 0x1b9, 1), (378, 0x1ba, 1), (379, 0x1bb, 1), (380, 0x1bc, 1), (381, 0x1bd, 1), (382, 0x1be, 1), (383, 0x1bf, 1), (384, 0x1c0, 1),
+            (385, 0x1c1, 1), (386, 0x1c2, 1), (387, 0x1c3, 1), (388, 0x1c4, 1), (389, 0x1c5, 1), (390, 0x1c6, 1), (391, 0x1c7, 1), (392, 0x1c8, 1), (393, 0x1c9, 1), (394, 0x1ca, 1), (395, 0x1cb, 1), (396, 0x1cc, 1), (397, 0x1cd, 1), (398, 0x1ce, 1), (399, 0x1cf, 1), (400, 0x1d0, 1),
+            (401, 0x1d1, 1), (402, 0x1d2, 1), (403, 0x1d3, 1), (404, 0x1d4, 1), (405, 0x1d5, 1), (406, 0x1d6, 1), (407, 0x1d7, 1), (408, 0x1d8, 1), (409, 0x1d9, 1), (410, 0x1da, 1), (411, 0x1db, 1), (412, 0x1dc, 1), (413, 0x1dd, 1), (414, 0x1de, 1), (415, 0x1df, 1), (416, 0x1e0, 1),
+            (417, 0x1e1, 1), (418, 0x1e2, 1), (419, 0x1e3, 1), (420, 0x1e4, 1), (421, 0x1e5, 1), (422, 0x1e6, 1), (423, 0x1e7, 1), (424, 0x1e8, 1), (425, 0x1e9, 1), (426, 0x1ea, 1), (427, 0x1eb, 1), (428, 0x1ec, 1), (429, 0x1ed, 1), (430, 0x1ee, 1), (431, 0x1ef, 1), (432, 0x1f0, 1),
+            (433, 0x1f1, 1), (434, 0x1f2, 1), (435, 0x1f3, 1), (436, 0x1f4, 1), (437, 0x1f5, 1), (438, 0x1f6, 1), (439, 0x1f7, 1), (440, 0x1f8, 1), (441, 0x1f9, 1), (442, 0x1fa, 1), (443, 0x1fb, 1), (444, 0x1fc, 1), (445, 0x1fd, 1), (446, 0x1fe, 1), (447, 0x1ff, 1), (448, 0x200, 1),
+            (449, 0x201, 1), (450, 0x202, 1), (451, 0x203, 1), (452, 0x204, 1), (453, 0x205, 1), (454, 0x206, 1), (455, 0x207, 1), (456, 0x208, 1), (457, 0x209, 1), (458, 0x20a, 1), (459, 0x20b, 1), (460, 0x20c, 1), (461, 0x20d, 1), (462, 0x20e, 1), (463, 0x20f, 1), (464, 0x210, 1),
+            (465, 0x211, 1), (466, 0x212, 1), (467, 0x213, 1), (468, 0x214, 1), (469, 0x215, 1), (470, 0x216, 1), (471, 0x217, 1), (472, 0x218, 1), (473, 0x219, 1), (474, 0x21a, 1), (475, 0x21b, 1), (476, 0x21c, 1), (477, 0x21d, 1), (478, 0x21e, 1), (479, 0x21f, 1), (480, 0x220, 1),
+            (481, 0x221, 1), (482, 0x222, 1), (483, 0x223, 1), (484, 0x224, 1), (485, 0x225, 1), (486, 0x226, 1), (487, 0x227, 1), (488, 0x228, 1), (489, 0x229, 1), (490, 0x22a, 1), (491, 0x22b, 1), (492, 0x22c, 1), (493, 0x22d, 1), (494, 0x22e, 1), (495, 0x22f, 1), (496, 0x230, 1),
+            (497, 0x231, 1), (498, 0x232, 1), (499, 0x233, 1), (500, 0x234, 1), (501, 0x235, 1), (502, 0x236, 1), (503, 0x237, 1), (504, 0x238, 1), (505, 0x239, 1), (506, 0x23a, 1), (507, 0x23b, 1), (508, 0x23c, 1), (509, 0x23d, 1), (510, 0x23e, 1), (511, 0x23f, 1), (512, 0x240, 1),
+            (513, 0x241, 1), (514, 0x242, 1), (515, 0x243, 1), (516, 0x244, 1), (517, 0x245, 1), (518, 0x246, 1), (519, 0x247, 1), (520, 0x248, 1), (521, 0x249, 1), (522, 0x24a, 1), (523, 0x24b, 1), (524, 0x24c, 1), (525, 0x24d, 1), (526, 0x24e, 1), (527, 0x24f, 1), (528, 0x250, 1),
+            (529, 0x251, 1), (530, 0x252, 1), (531, 0x253, 1), (532, 0x254, 1), (533, 0x255, 1), (534, 0x256, 1), (535, 0x257, 1), (536, 0x258, 1), (537, 0x259, 1), (538, 0x25a, 1), (539, 0x25b, 1), (540, 0x25c, 1), (541, 0x25d, 1), (542, 0x25e, 1), (543, 0x25f, 1), (544, 0x260, 1),
+            (545, 0x261, 1), (546, 0x262, 1), (547, 0x263, 1), (548, 0x264, 1), (549, 0x265, 1), (550, 0x266, 1), (551, 0x267, 1), (552, 0x268, 1), (553, 0x269, 1), (554, 0x26a, 1), (555, 0x26b, 1), (556, 0x26c, 1), (557, 0x26d, 1), (558, 0x26e, 1), (559, 0x26f, 1), (560, 0x270, 1),
+            (561, 0x271, 1), (562, 0x272, 1), (563, 0x273, 1), (564, 0x274, 1), (565, 0x275, 1), (566, 0x276, 1), (567, 0x277, 1), (568, 0x278, 1), (569, 0x279, 1), (570, 0x27a, 1), (571, 0x27b, 1), (572, 0x27c, 1), (573, 0x27d, 1), (574, 0x27e, 1), (575, 0x27f, 1), (576, 0x280, 1),
+            (577, 0x281, 1), (578, 0x282, 1), (579, 0x283, 1), (580, 0x284, 1), (581, 0x285, 1), (582, 0x286, 1), (583, 0x287, 1), (584, 0x288, 1), (585, 0x289, 1), (586, 0x28a, 1), (587, 0x28b, 1), (588, 0x28c, 1), (589, 0x28d, 1), (590, 0x28e, 1), (591, 0x28f, 1), (592, 0x290, 1),
+            (593, 0x291, 1), (594, 0x292, 1), (595, 0x293, 1), (596, 0x294, 1), (597, 0x295, 1), (598, 0x296, 1), (599, 0x297, 1), (600, 0x298, 1), (601, 0x299, 1),
         ]);
         Ok(())
     }
