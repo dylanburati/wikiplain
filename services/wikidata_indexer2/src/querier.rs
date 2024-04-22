@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -84,7 +84,7 @@ impl WikidataLeaf {
 }
 
 struct WikidataIndex<'a> {
-    raw: &'a [u8],
+    _raw: &'a [u8],
     n_groups: u64,
     group_offsets_native: &'a [u64],
     n_levels: u64,
@@ -170,7 +170,7 @@ impl<'a> WikidataIndex<'a> {
         eprintln!("leaf_level_native.len() = {}", leaf_level_native.len());
 
         Ok(WikidataIndex {
-            raw,
+            _raw: raw,
             n_groups: n_groups64,
             group_offsets_native,
             n_levels,
@@ -279,6 +279,16 @@ impl<'a> WikidataIndex<'a> {
     }
 }
 
+fn parse_entity_id(i: &str) -> Option<u64> {
+    if i.len() <= 1 {
+        return None;
+    }
+    let (kind_str, id_str) = i.split_at(1);
+    let id_num: u64 = id_str.parse().ok()?;
+    let kind_num = (kind_str.as_bytes()[0] as u64) << 56;
+    Some(kind_num | id_num)
+}
+
 fn read_dicts_file(
     index: &WikidataIndex<'_>,
     path: &str,
@@ -312,9 +322,25 @@ fn read_dicts_file(
     Ok(result)
 }
 
+fn read_en_index_file(path: &str) -> Result<HashMap<String, u64>> {
+    let en_index_file = OpenOptions::new().read(true).open(path)?;
+    let en_index_file = StdBufReader::with_capacity(65536, en_index_file);
+    let mut result = HashMap::new();
+    for line_res in en_index_file.lines() {
+        let mut line = line_res?;
+        let cut = line.find('\t').ok_or_else(|| ErrorKind::EntityError("invalid line in en.index.txt"))?;
+        let value_s = line.split_off(cut+1);
+        line.pop().unwrap();  // remove the '\t'
+        let value = parse_entity_id(&value_s).ok_or_else(|| ErrorKind::EntityError("invalid entity ID in en.index.txt"))?;
+        let _ = result.insert(line, value);
+    }
+    Ok(result)
+}
+
 #[derive(Deserialize)]
 enum QueryType {
     Id,
+    Title,
 }
 
 #[derive(Deserialize)]
@@ -328,12 +354,10 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
     let base = path.strip_suffix(".zst").unwrap_or(path);
     let dicts_path = base.to_string() + ".zdicts";
     let index_path = base.to_string() + ".index.bin";
-    //let en_index_path = base.to_string() + "-en.index.txt";
+    let en_index_path = base.to_string() + "-en.index.txt";
 
     let index_file = OpenOptions::new().read(true).open(index_path)?;
-    //let en_index_file = OpenOptions::new()
-    //.read(true)
-    //.open(en_index_path)?;
+    let en_index = read_en_index_file(&en_index_path)?;
 
     let index_mapped = unsafe { Mmap::map(&index_file)? };
     let wd_index = WikidataIndex::try_from(&index_mapped[..])?;
@@ -392,17 +416,16 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                         QueryType::Id => query
                             .args
                             .into_iter()
-                            .map(|s| {
-                                if s.len() > 1 {
-                                    let (kind_str, id_str) = s.split_at(1);
-                                    let id_num: u64 = id_str.parse().ok()?;
-                                    let kind_num = (kind_str.as_bytes()[0] as u64) << 56;
-                                    Some(kind_num | id_num)
-                                } else {
-                                    None
-                                }
-                            })
+                            .map(|id| parse_entity_id(&id))
                             .collect(),
+                        QueryType::Title => Some(
+                            query
+                                .args
+                                .into_iter()
+                                .filter_map(|title| en_index.get(&title))
+                                .copied()
+                                .collect(),
+                        ),
                     };
                     let query_keys = match query_keys {
                         Some(lst) => lst,
@@ -446,24 +469,21 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                     if !data_ranges.is_empty() {
                         workers.push((Arc::clone(dict0), data_ranges));
                     }
-                    let line_results = workers
-                        .iter()
-                        .flat_map(|(dict, rng_list)| {
-                            rng_list
-                                .into_iter()
-                                .map(|(offset, length)| -> Result<Vec<u8>> {
-                                    let mut data_file = data_file_shared.lock().unwrap();
-                                    let _ = data_file.seek(SeekFrom::Start(*offset))?;
-                                    let mut buf = vec![0u8; *length as usize];
-                                    data_file.read_exact(&mut buf)?;
-                                    let out = Vec::new();
-                                    let mut decoder =
-                                        Decoder::with_prepared_dictionary(out, dict)?;
-                                    decoder.write_all(&buf)?;
-                                    decoder.flush()?;
-                                    Ok(decoder.into_inner())
-                                })
-                        });
+                    let line_results = workers.iter().flat_map(|(dict, rng_list)| {
+                        rng_list
+                            .into_iter()
+                            .map(|(offset, length)| -> Result<Vec<u8>> {
+                                let mut data_file = data_file_shared.lock().unwrap();
+                                let _ = data_file.seek(SeekFrom::Start(*offset))?;
+                                let mut buf = vec![0u8; *length as usize];
+                                data_file.read_exact(&mut buf)?;
+                                let out = Vec::new();
+                                let mut decoder = Decoder::with_prepared_dictionary(out, dict)?;
+                                decoder.write_all(&buf)?;
+                                decoder.flush()?;
+                                Ok(decoder.into_inner())
+                            })
+                    });
                     let mut response = Vec::new();
                     let mut n_lines = 0;
                     for line_res in line_results {
@@ -482,8 +502,7 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                             // safety: `response` was parsed as json in the create step, which
                             // would have errored on non-utf8 chars. Also, the send_text call only uses
                             // str::as_bytes.
-                            let response_str =
-                                unsafe { std::str::from_utf8_unchecked(&response) };
+                            let response_str = unsafe { std::str::from_utf8_unchecked(&response) };
                             sender.send_text(response_str).await?;
                             sender.flush().await?;
                             response.clear();

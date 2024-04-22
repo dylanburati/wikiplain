@@ -418,6 +418,7 @@ fn write_segmented(
             };
             let mut id_str = None;
             let mut claims = None;
+            let mut title = None;
             for (k, v) in entity_kvs {
                 match k.borrow() {
                     "id" => match v {
@@ -437,11 +438,10 @@ fn write_segmented(
                             if let Some((_, JsonValue::Object(link_kvs))) =
                                 sitelinks_kvs.into_iter().find(|(k, _)| k == "enwiki")
                             {
-                                if let Some((_, JsonValue::Str(title))) =
+                                if let Some((_, JsonValue::Str(t))) =
                                     link_kvs.into_iter().find(|(k, _)| k == "title")
                                 {
-                                    writeln!(output_en, "{}\t{}", entity_number, title)?;
-                                    enwiki_count += 1;
+                                    title = Some(t);
                                 }
                             }
                         }
@@ -451,6 +451,10 @@ fn write_segmented(
                 }
             }
             let id_str = id_str.ok_or_else(|| ErrorKind::EntityError("missing id"))?;
+            if let Some(title) = title {
+                writeln!(output_en, "{}\t{}", title, id_str)?;
+                enwiki_count += 1;
+            }
             let (id_kind, id_num_str) = id_str.split_at(1);
             let id_num: u64 = id_num_str.parse()?;
             let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
@@ -462,10 +466,10 @@ fn write_segmented(
                 .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
             ind_entries.push((id, compressed_offset, csize_32));
             for (prop_id_str, _) in claims.into_iter().flatten() {
-                let (id_kind, id_num_str) = prop_id_str.split_at(1);
-                let id_num: u64 = id_num_str.parse()?;
-                let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
-                prop_ind_entries.push((id, entity_number));
+                let (prop_kind, prop_num_str) = prop_id_str.split_at(1);
+                let prop_num: u64 = prop_num_str.parse()?;
+                let prop_id = prop_num | ((prop_kind.as_bytes()[0] as u64) << 56);
+                prop_ind_entries.push((prop_id, id));
             }
             compressed_offset += csize as u64;
             entity_number += 1;

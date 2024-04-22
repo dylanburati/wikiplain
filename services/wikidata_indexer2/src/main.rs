@@ -8,6 +8,8 @@ mod querier;
 
 error_chain! {
     foreign_links {
+        FromUtf8Error(std::string::FromUtf8Error);
+        Utf8Error(std::str::Utf8Error);
         IoError(std::io::Error);
         ParseIntError(std::num::ParseIntError);
         WsHandshakeError(soketto::handshake::Error);
