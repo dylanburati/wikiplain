@@ -8,6 +8,7 @@ mod dumps;
 mod wikitext;
 mod wikitext_ast;
 
+use tantivy::tokenizer::{TextAnalyzer, SimpleTokenizer, LowerCaser, TokenStream, AsciiFoldingFilter};
 use wikitext::Token;
 use wikitext_ast::Node;
 
@@ -262,6 +263,40 @@ fn parse_tokens(tokens: Vec<PyRef<PyToken>>) -> PyResult<PyNode> {
         .map(|doc| doc.into())
 }
 
+//lazy_static! {
+    //static ref NLP_TOKENIZER: BoxTokenStream<'static> = TextAnalyzer::builder(SimpleTokenizer::default())
+        //.filter(LowerCaser)
+        //.build();
+//}
+
+/// Tokenize each English phrase as a space-separated term
+#[pyfunction]
+fn nlp_tokenize(text: Vec<String>) -> PyResult<Vec<String>> {
+    let mut nlp = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(AsciiFoldingFilter)
+        .filter(LowerCaser)
+        .build();
+    let mut result = Vec::with_capacity(text.len());
+    for phrase in text.iter() {
+        let mut stream = nlp.token_stream(phrase);
+        let mut term = String::with_capacity(phrase.len());
+        while let Some(t) = stream.next() {
+            if !matches!(t.text.as_str(), "(" | "[" | "{" | "<" | "\"" | "'" | "«" | "‘" | "‚" | "‛" | "“" | "„" | "‟" | "‹" | "❮" | "``") {
+                term.push_str(t.text.as_str());
+                break;
+            }
+        }
+        while let Some(t) = stream.next() {
+            if !matches!(t.text.as_str(), "(" | "[" | "{" | "<" | "\"" | "'" | "«" | "‘" | "‚" | "‛" | "“" | "„" | "‟" | "‹" | "❮" | "``") {
+                term.push(' ');
+                term.push_str(t.text.as_str());
+            }
+        }
+        result.push(term);
+    }
+    Ok(result)
+}
+
 /// Tokenize Wikitext and build a syntax tree.
 #[pyfunction]
 fn parse(text: &str) -> PyResult<PyNode> {
@@ -318,6 +353,7 @@ fn wikiplain(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyNode>()?;
     m.add_function(wrap_pyfunction!(load_bz2, m)?)?;
     m.add_function(wrap_pyfunction!(test_parser, m)?)?;
+    m.add_function(wrap_pyfunction!(nlp_tokenize, m)?)?;
     m.add_function(wrap_pyfunction!(tokenize, m)?)?;
     m.add_function(wrap_pyfunction!(parse_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;

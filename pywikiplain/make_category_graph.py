@@ -47,7 +47,7 @@ def get_category_id_map(ctx: Context, pqf: pq.ParquetFile) -> dict[str, int]:
     iterator = filter(lambda e: not e[2] and e[1] == 14, iterator)
     result = {}
     for aid, _, _, title in iterator:
-        result[title[len(CATEGORY_PREFIX):]] = aid
+        result[title[len(CATEGORY_PREFIX):]] = int(aid)
     return result
 
 def create_table(ctx: Context, category_id_map: dict[str, int]) -> None:
@@ -104,9 +104,11 @@ def stream_into_table(fp: gzip.GzipFile, category_id_map: dict[str, int], conn: 
 
 
 if __name__ == "__main__":
+    with open(sys.argv[2], "rb") as fp:
+        _, pqf_size = cbor2.load(fp)
     ctx = Context(
         enwiki_parquet_filename=sys.argv[1],
-        pqf_size=int(sys.argv[2]),
+        pqf_size=pqf_size,
         categorylinks_url=sys.argv[3],
         database_uri=sys.argv[4],
         enwiki_dir=sys.argv[5]
@@ -115,11 +117,11 @@ if __name__ == "__main__":
         os.mkdir(f"{ctx.enwiki_dir}/categories")
     except FileExistsError:
         pass
-    # pqf = pq.ParquetFile(ctx.enwiki_parquet_filename)
-    # category_id_map = get_category_id_map(ctx, pqf)
-    # with open(ctx.category_id_map_filename, "wb") as fp:
-    #     cbor2.dump(category_id_map, fp)
+    pqf = pq.ParquetFile(ctx.enwiki_parquet_filename)
+    category_id_map = get_category_id_map(ctx, pqf)
+    with open(ctx.category_id_map_filename, "wb") as fp:
+        cbor2.dump(category_id_map, fp)
     print(ctx)
-    with open(ctx.category_id_map_filename, "rb") as fp:
-        category_id_map = cbor2.load(fp)
+    # with open(ctx.category_id_map_filename, "rb") as fp:
+        # category_id_map = cbor2.load(fp)
     create_table(ctx, category_id_map)
