@@ -1,23 +1,71 @@
-use std::borrow::Borrow;
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::result::Result as StdResult;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use flate2::read::MultiGzDecoder;
-use nom::error::VerboseError;
-use nom::AsBytes;
+use itertools::Itertools;
 use rand::Rng;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
+use serde::Deserialize;
 use zstd::bulk::Compressor;
 use zstd::dict::EncoderDictionary;
 
-use crate::creator::item_parser::JsonValue;
 use crate::querier::WikidataLeaf;
-use crate::{ErrorKind, Result};
+use crate::{Error, ErrorKind, Result};
 
-use self::item_parser::{JsonPathItem, Selector};
+#[derive(Deserialize)]
+struct HasTitle {
+    title: String,
+}
 
-mod item_parser;
+#[derive(Deserialize)]
+struct WikidataClaimValue {}
+
+#[derive(Deserialize)]
+struct WikidataSitelinks {
+    enwiki: Option<HasTitle>,
+}
+
+#[derive(Deserialize)]
+struct WikidataEntityJson {
+    id: String,
+    sitelinks: Option<WikidataSitelinks>,
+    claims: FxHashMap<String, Vec<WikidataClaimValue>>,
+}
+
+struct WikidataEntity {
+    id: u64,
+    id_str: String,
+    enwiki_title: Option<String>,
+    claims: Vec<u64>,
+}
+
+impl TryFrom<WikidataEntityJson> for WikidataEntity {
+    type Error = Error;
+
+    fn try_from(value: WikidataEntityJson) -> StdResult<Self, Self::Error> {
+        let WikidataEntityJson { id: id_str, sitelinks, claims: claims_raw } = value;
+        let (id_kind, id_num_str) = id_str.split_at(1);
+        let id_num: u64 = id_num_str.parse()?;
+        let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
+        let enwiki_title = sitelinks.and_then(|obj| obj.enwiki).map(|obj| obj.title);
+        let claims = claims_raw.into_keys().map(|id_str| {
+            let (id_kind, id_num_str) = id_str.split_at(1);
+            let id_num: u64 = id_num_str.parse()?;
+            Ok(id_num | ((id_kind.as_bytes()[0] as u64) << 56))
+        }).collect::<Result<Vec<_>>>()?;
+
+        Ok(WikidataEntity {
+            id,
+            id_str,
+            enwiki_title,
+            claims,
+        })
+    }
+}
 
 pub const TREE_FANOUT: u32 = 256;
 const TREE_FANOUT_LONG: u64 = TREE_FANOUT as u64;
@@ -354,9 +402,8 @@ fn write_segmented(
     // Skip "[\n", then buffer starting from the first object / second line
     let mut array_start_buf = [0u8; 2];
     input.read_exact(&mut array_start_buf)?;
-    let mut input = BufReader::new(input);
+    let input = BufReader::new(input);
 
-    let mut line = Vec::new();
     let mut eof = false;
     let mut enwiki_count = 0;
     let mut ind_entries: Vec<(u64, u64, u32)> = vec![];
@@ -367,16 +414,9 @@ fn write_segmented(
     let mut compressed_offset: u64 = 0;
     let mut group_offsets = vec![];
     let mut compressed_buf = Vec::with_capacity(1024 * 1024);
-    let selectors = [
-        Selector::new(vec![JsonPathItem::Key("id")]),
-        Selector::new(vec![
-            JsonPathItem::Key("sitelinks"),
-            JsonPathItem::Key("enwiki"),
-            JsonPathItem::Key("title"),
-        ]),
-        Selector::new(vec![JsonPathItem::Key("claims")]),
-    ];
 
+    let lines_lazy_iterable = input.split(b'\n').chunks(100);
+    let mut lines_lazy_iter = lines_lazy_iterable.into_iter();
     while !eof {
         let next_group_start = entity_number + ENTITIES_PER_CDICT as u64;
         let cdict_bytes = dict_supplier.recv().unwrap()?;
@@ -387,101 +427,54 @@ fn write_segmented(
         group_offsets.push(compressed_offset);
 
         while entity_number < next_group_start {
-            line.clear();
-            compressed_buf.clear();
-            let got = input.read_until(b'\n', &mut line)?;
-            if got == 0 {
+            let Some(lines_lazy) = lines_lazy_iter.next() else {
                 eof = true;
                 break;
-            }
-            let Some(json_str) = line.strip_suffix(b",\n") else {
-                continue;
             };
-            let (_, ent) = item_parser::parse_json::<VerboseError<&[u8]>>(json_str, &selectors)
-                .map_err(|err| {
-                    eprintln!(
-                        "{:?}",
-                        err.map(|inner| inner
-                            .errors
-                            .into_iter()
-                            .map(|(i, k)| (
-                                std::str::from_utf8(i).unwrap_or_else(|_| "<non-utf8>"),
-                                k
-                            ))
-                            .collect::<Vec<_>>())
+            let lines = lines_lazy.collect::<StdResult<Vec<_>, _>>()?;
+            let entity_results: Vec<_> = lines
+                .par_iter()
+                .filter(|line| line.starts_with(b"{"))
+                .map(|line| -> Result<(&[u8], WikidataEntityJson)> {
+                    let json_str = line.strip_suffix(b",").unwrap_or(&line[..]);
+                    let ent = serde_json::from_slice(json_str)?;
+                    Ok((json_str, ent))
+                })
+                .collect();
+            let entities: Vec<(&[u8], WikidataEntity)> = entity_results.into_iter().try_fold(
+                Vec::with_capacity(100),
+                |mut acc, res| -> Result<_> {
+                    let (json, ent_raw) = res?;
+                    let ent = ent_raw.try_into()?;
+                    acc.push((json, ent));
+                    Ok(acc)
+                },
+            )?;
+            for (json_str, ent) in entities {
+                if let Some(title) = ent.enwiki_title {
+                    writeln!(output_en, "{}\t{}", title, ent.id_str)?;
+                    enwiki_count += 1;
+                }
+                let mut enc = Compressor::with_prepared_dictionary(&cdict)?;
+                let csize = enc.compress_to_buffer(json_str, &mut compressed_buf)?;
+                output_plain.write_all(&compressed_buf)?;
+                let csize_32 = csize
+                    .try_into()
+                    .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
+                ind_entries.push((ent.id, compressed_offset, csize_32));
+                for prop_id in ent.claims.into_iter() {
+                    prop_ind_entries.push((prop_id, ent.id));
+                }
+                compressed_offset += csize as u64;
+                entity_number += 1;
+                if entity_number % 1000 == 0 {
+                    eprint!(
+                        "\r\x1b[K{:>12}\t{:>12}\t{:>8}",
+                        prop_staged_count + prop_ind_entries.len() as u64,
+                        staged_count + ind_entries.len() as u64,
+                        enwiki_count
                     );
-                    ErrorKind::ParseJsonError
-                })?;
-            let entity_kvs = match ent {
-                JsonValue::Object(kvs) => kvs,
-                _ => {
-                    return Err(ErrorKind::EntityError("not an object").into());
                 }
-            };
-            let mut id_str = None;
-            let mut claims = None;
-            let mut title = None;
-            for (k, v) in entity_kvs {
-                match k.borrow() {
-                    "id" => match v {
-                        JsonValue::Str(s) => id_str = Some(s),
-                        _ => {
-                            return Err(ErrorKind::EntityError("id not a string").into());
-                        }
-                    },
-                    "claims" => match v {
-                        JsonValue::Object(claim_kvs) => claims = Some(claim_kvs),
-                        _ => {
-                            return Err(ErrorKind::EntityError("id not a string").into());
-                        }
-                    },
-                    "sitelinks" => match v {
-                        JsonValue::Object(sitelinks_kvs) => {
-                            if let Some((_, JsonValue::Object(link_kvs))) =
-                                sitelinks_kvs.into_iter().find(|(k, _)| k == "enwiki")
-                            {
-                                if let Some((_, JsonValue::Str(t))) =
-                                    link_kvs.into_iter().find(|(k, _)| k == "title")
-                                {
-                                    title = Some(t);
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
-            let id_str = id_str.ok_or_else(|| ErrorKind::EntityError("missing id"))?;
-            if let Some(title) = title {
-                writeln!(output_en, "{}\t{}", title, id_str)?;
-                enwiki_count += 1;
-            }
-            let (id_kind, id_num_str) = id_str.split_at(1);
-            let id_num: u64 = id_num_str.parse()?;
-            let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
-            let mut enc = Compressor::with_prepared_dictionary(&cdict)?;
-            let csize = enc.compress_to_buffer(json_str.as_bytes(), &mut compressed_buf)?;
-            output_plain.write_all(&compressed_buf)?;
-            let csize_32 = csize
-                .try_into()
-                .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
-            ind_entries.push((id, compressed_offset, csize_32));
-            for (prop_id_str, _) in claims.into_iter().flatten() {
-                let (prop_kind, prop_num_str) = prop_id_str.split_at(1);
-                let prop_num: u64 = prop_num_str.parse()?;
-                let prop_id = prop_num | ((prop_kind.as_bytes()[0] as u64) << 56);
-                prop_ind_entries.push((prop_id, id));
-            }
-            compressed_offset += csize as u64;
-            entity_number += 1;
-            if entity_number % 1000 == 0 {
-                eprint!(
-                    "\r\x1b[K{:>12}\t{:>12}\t{:>8}",
-                    prop_staged_count + prop_ind_entries.len() as u64,
-                    staged_count + ind_entries.len() as u64,
-                    enwiki_count
-                );
             }
         }
         if !eof && ind_entries.len() >= STG_BLOCK_LIMIT {
