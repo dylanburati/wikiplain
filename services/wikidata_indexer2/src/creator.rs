@@ -12,6 +12,7 @@ use zstd::bulk::Compressor;
 use zstd::dict::EncoderDictionary;
 
 use crate::creator::item_parser::JsonValue;
+use crate::querier::WikidataLeaf;
 use crate::{ErrorKind, Result};
 
 use self::item_parser::{JsonPathItem, Selector};
@@ -153,7 +154,7 @@ impl<R: Read> Iterator for DiskIter<R> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut buf = [0u8; 8];
         let a = match self.inner.read_exact(&mut buf) {
-            Ok(_) => u64::from_be_bytes(buf),
+            Ok(_) => u64::from_le_bytes(buf),
             Err(err) => {
                 return match err.kind() {
                     std::io::ErrorKind::UnexpectedEof => None,
@@ -163,13 +164,13 @@ impl<R: Read> Iterator for DiskIter<R> {
         };
 
         let b = match self.inner.read_exact(&mut buf) {
-            Ok(_) => u64::from_be_bytes(buf),
+            Ok(_) => u64::from_le_bytes(buf),
             Err(err) => return Some(Err(err)),
         };
 
         let mut buf = [0u8; 4];
         let c = match self.inner.read_exact(&mut buf) {
-            Ok(_) => u32::from_be_bytes(buf),
+            Ok(_) => u32::from_le_bytes(buf),
             Err(err) => return Some(Err(err)),
         };
 
@@ -265,11 +266,12 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
             .open(output_index_path)?;
         let mut staged_entry_files = vec![];
         let mut stg_offset = 0;
-        while stg_offset < 16 * segmented.staged_count {
+        let stride = std::mem::size_of::<WikidataLeaf>() as u64;
+        while stg_offset < stride * segmented.staged_count {
             let mut reader = OpenOptions::new().read(true).open(working_path)?;
             let _ = reader.seek(SeekFrom::Start(stg_offset))?;
-            staged_entry_files.push(reader.take(16 * STG_BLOCK_LIMIT as u64));
-            stg_offset += 16 * STG_BLOCK_LIMIT as u64;
+            staged_entry_files.push(reader.take(stride * STG_BLOCK_LIMIT as u64));
+            stg_offset += stride * STG_BLOCK_LIMIT as u64;
         }
         let _ = write_index(
             segmented.ind_entries,
@@ -379,7 +381,7 @@ fn write_segmented(
         let next_group_start = entity_number + ENTITIES_PER_CDICT as u64;
         let cdict_bytes = dict_supplier.recv().unwrap()?;
         let cdict_size = cdict_bytes.len() as u32;
-        output_dicts.write_all(&cdict_size.to_be_bytes())?;
+        output_dicts.write_all(&cdict_size.to_le_bytes())?;
         output_dicts.write_all(&cdict_bytes)?;
         let cdict = EncoderDictionary::copy(&cdict_bytes, 3);
         group_offsets.push(compressed_offset);
@@ -488,9 +490,9 @@ fn write_segmented(
 
             let mut output_stg = BufWriter::with_capacity(131072, file_stg.take().unwrap());
             for (k, offset, length) in ind_entries.drain(0..STG_BLOCK_LIMIT) {
-                output_stg.write_all(&k.to_be_bytes())?;
-                output_stg.write_all(&offset.to_be_bytes())?;
-                output_stg.write_all(&length.to_be_bytes())?;
+                output_stg.write_all(&k.to_le_bytes())?;
+                output_stg.write_all(&offset.to_le_bytes())?;
+                output_stg.write_all(&length.to_le_bytes())?;
             }
             staged_count += STG_BLOCK_LIMIT as u64;
             let _ = file_stg.insert(output_stg.into_inner().map_err(std::io::Error::from)?);
@@ -510,8 +512,8 @@ fn write_segmented(
             let mut output_stg_secondary =
                 BufWriter::with_capacity(131072, file_stg_secondary.take().unwrap());
             for (k, eidx) in prop_ind_entries.drain(0..prop_write) {
-                output_stg_secondary.write_all(&k.to_be_bytes())?;
-                output_stg_secondary.write_all(&eidx.to_be_bytes())?;
+                output_stg_secondary.write_all(&k.to_le_bytes())?;
+                output_stg_secondary.write_all(&eidx.to_le_bytes())?;
             }
             prop_staged_count += STG_BLOCK_LIMIT as u64;
             let _ = file_stg_secondary.insert(
@@ -583,14 +585,14 @@ pub fn write_index<R: Read, W: Write + Seek>(
     //          the last.
     let mut offset: u64 = 0;
     let n_groups = group_offsets.len();
-    output.write_all(&u64::to_be_bytes(n_groups as u64))?;
+    output.write_all(&u64::to_le_bytes(n_groups as u64))?;
     offset += 8;
     for v in group_offsets.iter() {
-        output.write_all(&v.to_be_bytes())?;
+        output.write_all(&v.to_le_bytes())?;
         offset += 8;
     }
     let n_levels = level_descriptions.len();
-    output.write_all(&u64::to_be_bytes(n_levels as u64))?;
+    output.write_all(&u64::to_le_bytes(n_levels as u64))?;
     offset += 8;
     let mut level_offsets = vec![];
     for ld in level_descriptions[0..n_levels - 1].iter() {
@@ -631,9 +633,9 @@ pub fn write_index<R: Read, W: Write + Seek>(
             level_keys.push(item.0);
             level_pointers.push(offset);
         }
-        output.write_all(&item.0.to_be_bytes())?;
-        output.write_all(&item.1.to_be_bytes())?;
-        output.write_all(&item.2.to_be_bytes())?;
+        output.write_all(&item.0.to_le_bytes())?;
+        output.write_all(&item.1.to_le_bytes())?;
+        output.write_all(&item.2.to_le_bytes())?;
         offset += 20;
         ind_size += 1;
 
@@ -655,12 +657,12 @@ pub fn write_index<R: Read, W: Write + Seek>(
         for sz in ld.node_sizes() {
             next_level_keys.push(level_keys[j]);
             next_level_pointers.push(offset);
-            output.write_all(&(sz as u64).to_be_bytes())?;
+            output.write_all(&(sz as u64).to_le_bytes())?;
             for child_num in 1..(sz as usize) {
-                output.write_all(&level_keys[j + child_num].to_be_bytes())?;
+                output.write_all(&level_keys[j + child_num].to_le_bytes())?;
             }
             for child_num in 0..(sz as usize) {
-                output.write_all(&level_pointers[j + child_num].to_be_bytes())?;
+                output.write_all(&level_pointers[j + child_num].to_le_bytes())?;
             }
             offset += 16 * sz as u64;
             j += sz as usize;
@@ -761,31 +763,31 @@ mod tests {
             Self { data }
         }
 
-        fn be_to_u64(src: &[u8]) -> u64 {
+        fn le_to_u64(src: &[u8]) -> u64 {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(src);
-            u64::from_be_bytes(buf)
+            u64::from_le_bytes(buf)
         }
 
-        fn be_to_leafdata(src: &[u8]) -> (u64, u64, u32) {
+        fn le_to_leafdata(src: &[u8]) -> (u64, u64, u32) {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&src[..8]);
-            let a = u64::from_be_bytes(buf);
+            let a = u64::from_le_bytes(buf);
             buf.copy_from_slice(&src[8..16]);
-            let b = u64::from_be_bytes(buf);
+            let b = u64::from_le_bytes(buf);
             let mut buf = [0u8; 4];
             buf.copy_from_slice(&src[16..]);
-            (a, b, u32::from_be_bytes(buf))
+            (a, b, u32::from_le_bytes(buf))
         }
 
         fn n_groups(&self) -> u64 {
-            Self::be_to_u64(&self.data[..8])
+            Self::le_to_u64(&self.data[..8])
         }
 
         fn group_offsets(&self, n_groups: u64) -> Vec<u64> {
             self.data[8..]
                 .chunks_exact(8)
-                .map(Self::be_to_u64)
+                .map(Self::le_to_u64)
                 .take(n_groups as usize)
                 .collect()
         }
@@ -800,13 +802,13 @@ mod tests {
             let mut res = vec![];
             let mut n_ptrs = 0;
             for _ in 0..n_nodes {
-                let w = Self::be_to_u64(&self.data[base..base + 8]);
+                let w = Self::le_to_u64(&self.data[base..base + 8]);
                 n_ptrs += w;
                 let w = w as usize;
                 res.extend(
                     self.data[base..]
                         .chunks_exact(8)
-                        .map(Self::be_to_u64)
+                        .map(Self::le_to_u64)
                         .take(2 * w),
                 );
                 base += 16 * w;
@@ -818,7 +820,7 @@ mod tests {
             let base = pos as usize;
             self.data[base..]
                 .chunks_exact(20)
-                .map(Self::be_to_leafdata)
+                .map(Self::le_to_leafdata)
                 .collect()
         }
     }
