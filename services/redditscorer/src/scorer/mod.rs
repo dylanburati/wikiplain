@@ -104,7 +104,7 @@ type ChannelPair<T> = (Sender<T>, Receiver<T>);
 
 struct ReaderContext {
     file: File,
-    domains: FxHashSet<String>,
+    db_path: String,
     task_id: String,
 }
 
@@ -134,6 +134,19 @@ struct SubmissionMeta {
 }
 
 fn produce_titles(reader_ctx: ReaderContext, titles_push: Sender<Vec<String>>, progress_push: Arc<Sender<ProgressMsg>>) -> Result<()> {
+    let sqlconn = Connection::open(&reader_ctx.db_path)?;
+    let mut top_domains_stmt = sqlconn.prepare("SELECT k FROM top_domains")?;
+    let mut top_domains_iter = top_domains_stmt.query_map((), |row| {
+        let k: String = row.get(0)?;
+        Ok(k)
+    })?;
+    let domains =
+        top_domains_iter.try_fold(FxHashSet::default(), |mut acc, res| -> Result<_> {
+            let k = res?;
+            acc.insert(k);
+            Ok(acc)
+        })?;
+
     let mut stream = Decoder::new(reader_ctx.file)?;
     stream.window_log_max(31)?;
     let stream = BufReader::with_capacity(65536, stream);
@@ -197,7 +210,7 @@ fn produce_titles(reader_ctx: ReaderContext, titles_push: Sender<Vec<String>>, p
                 }
                 None => full_domain,
             };
-            if !reader_ctx.domains.contains(domain) {
+            if !domains.contains(domain) {
                 continue;
             }
             let dedup_key = full_domain.to_string() + "/" + path;
@@ -506,12 +519,6 @@ pub fn run_scorer(
     let progress_push = Arc::new(progress_push);
 
     // TODO load domains from database
-    let domains_str =
-        std::fs::read("/home/dylan/Downloads/enwiki/20240401/pagerank/top_cite_domains.json")?;
-    let domains_vec: Vec<(String, f64)> = serde_json::from_slice(&domains_str)?;
-    let mut domains = FxHashSet::default();
-    domains.extend(domains_vec.into_iter().map(|pair| pair.0));
-
     std::thread::scope(|s| {
         let mut handles = vec![];
         // Producer thread
@@ -530,13 +537,12 @@ pub fn run_scorer(
             let pos_model_ref = Arc::clone(&pos_model);
             let db_path_copy = db_path.clone();
             let output_dir_copy = output_dir.clone();
-            let domains_copy = domains.clone();
             handles.push(s.spawn(move || -> Result<()> {
                 for filename in filename_pull_ref.iter() {
                     let file = File::open(&filename)?;
                     let reader_ctx = ReaderContext {
                         file,
-                        domains: domains_copy.clone(),
+                        db_path: db_path_copy.clone(),
                         task_id: filename.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("").to_owned()
                     };
                     let worker_ctx = WorkerContext {
