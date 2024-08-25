@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::ops::Deref;
 
 use error_chain::error_chain;
-use pyo3::{exceptions::PyValueError, prelude::*, PyRef, wrap_pyfunction};
+use pyo3::{exceptions::PyValueError, prelude::*, wrap_pyfunction, PyRef};
 
 mod dumps;
 mod wikitext;
@@ -49,7 +49,8 @@ error_chain! {
 /// Load a Wikimedia XML dump into a parquet file.
 #[pyfunction]
 fn load_bz2(dump_path: &str, output_path: &str) -> PyResult<()> {
-    dumps::load_pages_articles(dump_path, output_path).map_err(|err| PyValueError::new_err(err.to_string()))
+    dumps::load_pages_articles(dump_path, output_path)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 /// Parse a SQL insert statement and get the table name and list of rows to insert.
@@ -76,6 +77,8 @@ enum PyTokenKind {
     ElementStart,
     ElementStartEnd,
     ElementEnd,
+    HeaderStart,
+    HeaderEnd,
     Content,
 }
 
@@ -113,6 +116,10 @@ impl<'a> From<Token<'a>> for PyToken {
                 PyToken::new(PyTokenKind::ElementStartEnd, Some(name))
             }
             Token::ElementEnd(name) => PyToken::new(PyTokenKind::ElementEnd, Some(name)),
+            Token::HeaderStart(name) => {
+                PyToken::new(PyTokenKind::HeaderStart, Some(name.to_owned()))
+            }
+            Token::HeaderEnd(name) => PyToken::new(PyTokenKind::HeaderEnd, Some(name.to_owned())),
             Token::Content(text) => PyToken::new(PyTokenKind::Content, Some(text.to_owned())),
         }
     }
@@ -141,6 +148,14 @@ impl<'a> TryFrom<&'a PyToken> for Token<'a> {
                 let name = value.data.as_ref().ok_or_else(e)?;
                 Ok(Token::ElementEnd(name.clone()))
             }
+            PyTokenKind::HeaderStart => {
+                let name = value.data.as_ref().ok_or_else(e)?;
+                Ok(Token::HeaderStart(name.as_str()))
+            }
+            PyTokenKind::HeaderEnd => {
+                let name = value.data.as_ref().ok_or_else(e)?;
+                Ok(Token::HeaderEnd(name.as_str()))
+            }
             PyTokenKind::Content => {
                 let text = value.data.as_ref().ok_or_else(e)?;
                 Ok(Token::Content(text.as_str()))
@@ -164,6 +179,7 @@ enum PyNodeKind {
     Element,
     Template,
     Link,
+    Header,
     Argument,
     Content,
 }
@@ -192,6 +208,11 @@ impl Debug for PyNode {
             }
             PyNodeKind::Template => f.debug_tuple("Template").field(&self.children).finish(),
             PyNodeKind::Link => f.debug_tuple("Link").field(&self.children).finish(),
+            PyNodeKind::Header => f
+                .debug_tuple("Header")
+                .field(&self.data.as_ref().map_or(0, String::len))
+                .field(&self.children)
+                .finish(),
             PyNodeKind::Argument => f.debug_tuple("Argument").field(&self.children).finish(),
             PyNodeKind::Content => {
                 let text = self.data.clone().unwrap_or("".to_string());
@@ -239,6 +260,11 @@ impl From<Node> for PyNode {
                 PyNodeKind::Link,
                 children.into_iter().map(PyNode::from).collect(),
                 None,
+            ),
+            Node::Header(lvl, children) => PyNode::new(
+                PyNodeKind::Header,
+                children.into_iter().map(PyNode::from).collect(),
+                Some("#".repeat(lvl).into()),
             ),
             Node::Argument(children) => PyNode::new(
                 PyNodeKind::Argument,
@@ -306,7 +332,8 @@ fn get_first_infobox_title(text: &str) -> PyResult<Option<String>> {
 /// must be capitalized).
 #[pyfunction]
 fn get_templates_by_name(text: &str, names: Vec<String>) -> PyResult<Vec<String>> {
-    wikitext::get_templates_by_name(text, names).map_err(|err| PyValueError::new_err(err.to_string()))
+    wikitext::get_templates_by_name(text, names)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 fn sql_module(py: Python, parent_module: &PyModule) -> PyResult<()> {
