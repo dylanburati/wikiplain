@@ -113,13 +113,13 @@ fn parse_any_for_structure<'a>(
 ) -> ParseResult<'a, Vec<Node>> {
     if let Some(first) = i.first() {
         match (overridden, first) {
-            (false, Token::TemplateStart | Token::LinkStart) => {
+            (false, Token::TemplateStart | Token::LinkStart | Token::HeaderStart(_)) => {
                 parse_structure(i, unclosed).map_within(|n| vec![n])
             }
-            (_, Token::ElementStart(_, _)) => parse_structure(i, unclosed).map_within(|n| vec![n]),
-            (false, Token::TemplateEnd | Token::LinkEnd) => {
+            (false, Token::TemplateEnd | Token::LinkEnd | Token::HeaderEnd(_)) => {
                 Err(ErrorKind::ASTParseError("parse_any_for_structure".into(), i.len()).into())
             }
+            (_, Token::ElementStart(_, _)) => parse_structure(i, unclosed).map_within(|n| vec![n]),
             (_, Token::ElementEnd(name)) => match name.as_str() {
                 "br" => Ok((&i[1..], unclosed, vec![Node::Content("\n".to_string())])),
                 n if is_void_element(n) => Ok((
@@ -207,7 +207,7 @@ fn parse_structure_inner<'a>(i: &'a [Token], u: Vec<&'a Token>) -> ParseResult<'
             Some(n) if n == stack_size - 1 => {
                 // Natural close found, consume it
                 input = rest;
-                unclosed = unclosed[..n].to_vec();
+                unclosed.pop();
                 break;
             }
             Some(_) => {
