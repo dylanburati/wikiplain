@@ -77,8 +77,6 @@ enum PyTokenKind {
     ElementStart,
     ElementStartEnd,
     ElementEnd,
-    HeaderStart,
-    HeaderEnd,
     Content,
 }
 
@@ -116,10 +114,6 @@ impl<'a> From<Token<'a>> for PyToken {
                 PyToken::new(PyTokenKind::ElementStartEnd, Some(name))
             }
             Token::ElementEnd(name) => PyToken::new(PyTokenKind::ElementEnd, Some(name)),
-            Token::HeaderStart(name) => {
-                PyToken::new(PyTokenKind::HeaderStart, Some(name.to_owned()))
-            }
-            Token::HeaderEnd(name) => PyToken::new(PyTokenKind::HeaderEnd, Some(name.to_owned())),
             Token::Content(text) => PyToken::new(PyTokenKind::Content, Some(text.to_owned())),
         }
     }
@@ -148,14 +142,6 @@ impl<'a> TryFrom<&'a PyToken> for Token<'a> {
                 let name = value.data.as_ref().ok_or_else(e)?;
                 Ok(Token::ElementEnd(name.clone()))
             }
-            PyTokenKind::HeaderStart => {
-                let name = value.data.as_ref().ok_or_else(e)?;
-                Ok(Token::HeaderStart(name.as_str()))
-            }
-            PyTokenKind::HeaderEnd => {
-                let name = value.data.as_ref().ok_or_else(e)?;
-                Ok(Token::HeaderEnd(name.as_str()))
-            }
             PyTokenKind::Content => {
                 let text = value.data.as_ref().ok_or_else(e)?;
                 Ok(Token::Content(text.as_str()))
@@ -179,7 +165,6 @@ enum PyNodeKind {
     Element,
     Template,
     Link,
-    Header,
     Argument,
     Content,
 }
@@ -208,11 +193,6 @@ impl Debug for PyNode {
             }
             PyNodeKind::Template => f.debug_tuple("Template").field(&self.children).finish(),
             PyNodeKind::Link => f.debug_tuple("Link").field(&self.children).finish(),
-            PyNodeKind::Header => f
-                .debug_tuple("Header")
-                .field(&self.data.as_ref().map_or(0, String::len))
-                .field(&self.children)
-                .finish(),
             PyNodeKind::Argument => f.debug_tuple("Argument").field(&self.children).finish(),
             PyNodeKind::Content => {
                 let text = self.data.clone().unwrap_or("".to_string());
@@ -260,11 +240,6 @@ impl From<Node> for PyNode {
                 PyNodeKind::Link,
                 children.into_iter().map(PyNode::from).collect(),
                 None,
-            ),
-            Node::Header(lvl, children) => PyNode::new(
-                PyNodeKind::Header,
-                children.into_iter().map(PyNode::from).collect(),
-                Some("#".repeat(lvl).into()),
             ),
             Node::Argument(children) => PyNode::new(
                 PyNodeKind::Argument,

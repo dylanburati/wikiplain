@@ -20,7 +20,6 @@ bitflags = "1.3.2"
 bzip2 = "0.4.4"
 crossbeam = { version = "0.8.2", features = ["crossbeam-channel"] }
 error-chain = "0.12.4"
-itertools = "0.13.0"
 lazy_static = "1.4.0"
 nom = "7.1.3"
 nom-sql = { path = "./vendor/nom-sql" }
@@ -28,3 +27,4 @@ parquet = "34.0.0"
 pyo3 = { workspace = true }
 quick-xml = "0.27.1"
 regex = "1.7.1"
+tantivy = "0.22.0"

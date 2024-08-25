@@ -54,7 +54,6 @@ pub enum Node {
     Element(String, Vec<Node>),
     Template(Vec<Node>),
     Link(Vec<Node>),
-    Header(usize, Vec<Node>),
     Argument(Vec<Node>),
     Content(String),
 }
@@ -113,13 +112,13 @@ fn parse_any_for_structure<'a>(
 ) -> ParseResult<'a, Vec<Node>> {
     if let Some(first) = i.first() {
         match (overridden, first) {
-            (false, Token::TemplateStart | Token::LinkStart | Token::HeaderStart(_)) => {
+            (false, Token::TemplateStart | Token::LinkStart) => {
                 parse_structure(i, unclosed).map_within(|n| vec![n])
             }
-            (false, Token::TemplateEnd | Token::LinkEnd | Token::HeaderEnd(_)) => {
-                Err(ErrorKind::ASTParseError(format!("parse_any_for_structure first={:?}", first), i.len()).into())
-            }
             (_, Token::ElementStart(_, _)) => parse_structure(i, unclosed).map_within(|n| vec![n]),
+            (false, Token::TemplateEnd | Token::LinkEnd) => {
+                Err(ErrorKind::ASTParseError("parse_any_for_structure".into(), i.len()).into())
+            }
             (_, Token::ElementEnd(name)) => match name.as_str() {
                 "br" => Ok((&i[1..], unclosed, vec![Node::Content("\n".to_string())])),
                 n if is_void_element(n) => Ok((
@@ -128,7 +127,7 @@ fn parse_any_for_structure<'a>(
                     vec![Node::Element(name.to_owned(), vec![])],
                 )),
                 _ => {
-                    Err(ErrorKind::ASTParseError(format!("parse_any_for_structure first={:?}", first), i.len()).into())
+                    Err(ErrorKind::ASTParseError("parse_any_for_structure".into(), i.len()).into())
                 }
             },
             _ => parse_content(i, unclosed, overridden).map_within(|strings| {
@@ -160,9 +159,6 @@ fn matching_pos(unclosed: &[&Token], current: &Token, overridden: bool) -> Optio
             .iter()
             .rposition(|c| matches!(c, Token::TemplateStart)),
         (false, Token::LinkEnd) => unclosed.iter().rposition(|c| matches!(c, Token::LinkStart)),
-        (false, Token::HeaderEnd(_)) => unclosed
-            .iter()
-            .rposition(|c| matches!(c, Token::HeaderStart(_))),
         (_, Token::ElementEnd(name)) => unclosed
             .iter()
             .rposition(|c| matches!(c, Token::ElementStart(n, false) if n == name)),
@@ -207,7 +203,7 @@ fn parse_structure_inner<'a>(i: &'a [Token], u: Vec<&'a Token>) -> ParseResult<'
             Some(n) if n == stack_size - 1 => {
                 // Natural close found, consume it
                 input = rest;
-                unclosed.pop();
+                unclosed = unclosed[..n].to_vec();
                 break;
             }
             Some(_) => {
@@ -232,12 +228,6 @@ fn parse_structure<'a>(i: &'a [Token], u: Vec<&'a Token>) -> ParseResult<'a, Nod
                 unclosed.push(first);
                 parse_structure_inner(rest, unclosed).map_within(Node::Link)
             }
-            Token::HeaderStart(marker) => {
-                let lvl = marker.chars().filter(|c| *c == '=').count();
-                unclosed.push(first);
-                parse_structure_inner(rest, unclosed)
-                    .map_within(|children| Node::Header(lvl, children))
-            }
             Token::ElementStart(name, is_self_closing) => {
                 if *is_self_closing || is_void_element(name.as_str()) {
                     Ok((rest, unclosed, Node::Element(name.to_owned(), vec![])))
@@ -259,11 +249,10 @@ fn parse_structure<'a>(i: &'a [Token], u: Vec<&'a Token>) -> ParseResult<'a, Nod
 fn parse_any<'a>(i: &'a [Token]) -> ParseResult<'a, Option<Node>> {
     let unclosed = vec![];
     match i.first().unwrap() {
-        Token::TemplateStart
-        | Token::LinkStart
-        | Token::ElementStart(_, _)
-        | Token::HeaderStart(_) => parse_structure(i, unclosed).map_within(Some),
-        Token::TemplateEnd | Token::LinkEnd | Token::HeaderEnd(_) => Ok((&i[1..], unclosed, None)),
+        Token::TemplateStart | Token::LinkStart | Token::ElementStart(_, _) => {
+            parse_structure(i, unclosed).map_within(Some)
+        }
+        Token::TemplateEnd | Token::LinkEnd => Ok((&i[1..], unclosed, None)),
         Token::ElementEnd(name) => {
             if is_void_element(name.as_str()) {
                 Ok((

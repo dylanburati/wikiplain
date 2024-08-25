@@ -4,14 +4,19 @@ use std::{
     iter::Peekable,
 };
 
-use itertools::Itertools;
 use lazy_static::lazy_static;
 use nom::{
-    branch::alt, bytes::complete::{tag, take_till, take_till1, take_until, take_while}, character::complete::char, combinator::{fail, map, map_opt, value}, sequence::{delimited, preceded, terminated}, AsBytes, IResult, InputIter
+    branch::alt,
+    bytes::complete::{tag, take_till, take_till1, take_until, take_while},
+    character::complete::{anychar, char},
+    combinator::{all_consuming, fail, map, map_opt, recognize, value},
+    multi::many0,
+    sequence::{delimited, preceded, terminated},
+    IResult, InputIter,
 };
 use regex::Regex;
 
-use crate::{ErrorKind, Result};
+use crate::{Error, ErrorKind, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Token<'a> {
@@ -22,8 +27,6 @@ pub enum Token<'a> {
     LinkEnd,
     ElementStart(String, bool),
     ElementEnd(String),
-    HeaderStart(&'a str),
-    HeaderEnd(&'a str),
     Content(&'a str),
 }
 
@@ -38,9 +41,7 @@ impl Display for Token<'_> {
             Token::ElementStart(name, false) => f.write_fmt(format_args!("<{}>", name)),
             Token::ElementStart(name, true) => f.write_fmt(format_args!("<{} />", name)),
             Token::ElementEnd(name) => f.write_fmt(format_args!("</{}>", name)),
-            Token::HeaderStart(text) | Token::HeaderEnd(text) | Token::Content(text) => {
-                f.write_str(text)
-            }
+            Token::Content(text) => f.write_str(text),
         }
     }
 }
@@ -76,75 +77,23 @@ fn parse_name_lower(i: &str) -> IResult<&str, String> {
     map(parse_name, |s| s.to_ascii_lowercase())(i)
 }
 
-fn parse_content(inp: &str, is_line_start0: bool) -> IResult<&str, Vec<Token>> {
-    let mut result = vec![];
-    // offset by 1
-    let mut indices = [0, 0, 0, 0, 0, 0];
-    let prev = if is_line_start0 { '\n' } else { '\0' };
-    let mut buffer = [prev, '\0', '\0', '\0', '\0', '\0'];
-    let mut resulted = 0;
-    for (i, c) in inp.iter_indices() {
-        let breakpoint = match c {
-            '<' => Some(i),
-            '{' | '}' | '[' | ']' => {
-                if buffer[0] == c {
-                    Some(i - 1)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some(consumed) = breakpoint {
-            if consumed == 0 {
-                return Err(nom::Err::Error(nom::error::Error::new(
-                    inp,
-                    nom::error::ErrorKind::TakeWhile1,
-                )));
-            }
-            result.push(Token::Content(&inp[resulted..consumed]));
-            return Ok((&inp[consumed..], result));
-        }
+fn is_special(c: char) -> bool {
+    c == '<' || c == '{' || c == '}' || c == '[' || c == ']'
+}
 
-        if c == ' ' || c == '\t' {
-            continue;
-        }
-        if c == '\n' && buffer[0] == '=' {
-            let breakpoint = match buffer {
-                ['=', '=', '=', '=', '=', _] => Some(indices[4]),
-                ['=', '=', '=', '=', _, _] => Some(indices[3]),
-                ['=', '=', '=', _, _, _] => Some(indices[2]),
-                ['=', '=', _, _, _, _] => Some(indices[1]),
-                ['=', _, _, _, _, _] => Some(indices[0]),
-                _ => None,
-            };
-            if let Some(hdr_end_start) = breakpoint {
-                result.push(Token::Content(&inp[resulted..hdr_end_start - 1]));
-                result.push(Token::HeaderEnd(&inp[hdr_end_start - 1..i]));
-                resulted = i;
-            }
-        } else if c != '=' && buffer[0] == '=' {
-            let breakpoint = match buffer {
-                ['=', '\n', _, _, _, _] => Some(indices[0]),
-                ['=', '=', '\n', _, _, _] => Some(indices[1]),
-                ['=', '=', '=', '\n', _, _] => Some(indices[2]),
-                ['=', '=', '=', '=', '\n', _] => Some(indices[3]),
-                ['=', '=', '=', '=', '=', '\n'] => Some(indices[4]),
-                _ => None,
-            };
-            if let Some(hdr_start_start) = breakpoint {
-                result.push(Token::Content(&inp[resulted..hdr_start_start - 1]));
-                result.push(Token::HeaderStart(&inp[hdr_start_start - 1..i]));
-                resulted = i;
-            }
-        }
-        indices.rotate_right(1);
-        indices[0] = i + 1;
-        buffer.rotate_right(1);
-        buffer[0] = c;
-    }
-    result.push(Token::Content(&inp[resulted..]));
-    Ok((&inp[inp.len()..], result))
+fn parse_content(i: &str) -> IResult<&str, &str> {
+    take_till(is_special)(i)
+}
+
+fn parse_token(i: &str) -> IResult<&str, Token> {
+    alt((
+        preceded(char('<'), parse_langle),
+        map(tag("{{"), |_| Token::TemplateStart),
+        map(tag("}}"), |_| Token::TemplateEnd),
+        map(tag("[["), |_| Token::LinkStart),
+        map(tag("]]"), |_| Token::LinkEnd),
+        map(recognize(preceded(anychar, parse_content)), Token::Content),
+    ))(i)
 }
 
 // preceding: '<'
@@ -216,146 +165,10 @@ fn parse_begin(i: &str) -> IResult<&str, Token> {
     fail("")
 }
 
-pub fn get_headings(text: &str) -> Result<Vec<(&str, usize)>> {
-    let mut acc = vec![];
-    for line in text.split('\n') {
-        if let Some(rest) = line.strip_prefix("=") {
-            let (leading, start_idx) = rest.as_bytes().iter().take_while(|c| c == b'=' || c == b' ' || c == b'\t')
-                .fold((1, 1), |(x, y), c| if c == b'=' {
-                    (x+1, y+1)
-                } else {
-                    (x, y+1)
-                });
-            if leading < line.len() {
-                let (trailing, end_idx) = line.as_bytes().iter().rev().take_while(c == b'=' || c == b' ' || c == b'\t')
-                    .fold((0, line.len()), |(x, y), c| if c == b'=' {
-                        (x+1, y-1)
-                    } else {
-                        (x, y-1)
-                    });
-
-                if leading == trailing {
-                    acc.push((&line[start_idx..end_idx], leading))
-                }
-            }
-        }
-    }
-    Ok(acc)
-}
-
 pub fn tokenize(text: &str) -> Result<Vec<Token>> {
-    let mut acc = vec![];
-    let mut all_lines_iterator = text.iter_indices()
-        .scan(0, |state, (byte_offset, ch)| {
-            let line_num = *state;
-            if ch == '\n' {
-                *state += 1;
-            }
-            Some((line_num, byte_offset, ch))
-        })
-        .peekable();
-    let line_start_indices = vec![];
-    let mut leading_equals = vec![];
-    let mut trailing_equals = vec![];
-    let mut line_num = 0;
-    loop {
-        let line_iterator = all_lines_iterator.peeking_take_while(|(l, _, _)| l == line_num);
-        let line_data = line_iterator.fold(None, |st, (_, byte_offset, ch)| {
-            match st {
-                // (byte_offset, len leading '=' streak, leading streak ended, len current '=' streak if not leading)
-                None => Some((byte_offset, usize::from(ch == '='), false, 0)),
-                Some((_, 0, _, _)) => st,
-                Some((idx, leading, false, _)) => match ch {
-                    '=' => Some((idx, leading+1, false, 0)),
-                    ' ' | '\t' => st,
-                    _ => Some((idx, leading, true, 0)),
-                }
-                Some((idx, leading, true, curr)) => match ch {
-                    '=' => Some((idx, leading, true, curr+1)),
-                    ' ' | '\t' => st,
-                    _ => Some((idx, leading, true, 0)),
-                }
-            }
-        });
-        let Some(())
-    }
-    
-    let mut line = 0;
-    let mut eq_streak = 0;
-    let mut all_eq = true;
-    for (curr_line, byte_offset, ch) in line_iterator {
-        if curr_line != line {
-            if leading_equals.len() < curr_line {
-                leading_equals.push(0);
-                trailing_equals.push(0);
-            } else {
-                trailing_equals.push(eq_streak);
-            }
-            line = curr_line;
-            eq_streak = 0;
-            all_eq = true;
-            line_start_indices.push(byte_offset);
-        }
-
-        if ch.is_space() {
-            continue;
-        }
-        if ch == '=' {
-            eq_streak += 1;
-        } else {
-            if leading_equals.len() < line+1 {
-                leading_equals.push(eq_streak);
-            }
-            eq_streak = 0;
-        }
-    }
-    
-
-    let mut last = '\n';
-    loop {
-        let mut ct = 0;
-        let mut ended = false;
-        while let Some((i, c)) = iterator.next() {
-            if c == '=' {
-                ct += 1;
-            }
-            if ct > 0 && (c == ' ' || c == '\t') {
-                continue;
-            }
-            ended = c == '\n';
-            break;
-        }
-
-
-    let mut i = text;
-    while !i.is_empty() {
-        let len = text.len();
-        let res = alt((
-            map(preceded(char('<'), parse_langle), |t| vec![t]),
-            map(tag("{{"), |_| vec![Token::TemplateStart]),
-            map(tag("}}"), |_| vec![Token::TemplateEnd]),
-            map(tag("[["), |_| vec![Token::LinkStart]),
-            map(tag("]]"), |_| vec![Token::LinkEnd]),
-            |inp| parse_content(inp, is_start),
-        ))(i);
-        is_start = false;
-        match res {
-            Err(e) => return Err(ErrorKind::WikitextParseError(e.to_string()).into()),
-            Ok((i1, o)) => {
-                // infinite loop check: the parser must always consume
-                if i1.len() == len {
-                    return Err(ErrorKind::WikitextParseError(format!(
-                        "alt parser consumed nothing"
-                    ))
-                    .into());
-                }
-
-                i = i1;
-                acc.extend(o.into_iter());
-            }
-        }
-    }
-    Ok(acc)
+    let (_, tokens) = all_consuming(many0(parse_token))(text)
+        .map_err(|e| Error::from(ErrorKind::WikitextParseError(e.to_string())))?;
+    Ok(tokens)
 }
 
 struct WikiPageContext<'a> {
