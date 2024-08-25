@@ -12,9 +12,10 @@ use nom::{
     combinator::{all_consuming, fail, map, map_opt, recognize, value},
     multi::many0,
     sequence::{delimited, preceded, terminated},
-    IResult, InputIter,
+    IResult, InputIter, Offset,
 };
 use regex::Regex;
+use tantivy::HasLen;
 
 use crate::{Error, ErrorKind, Result};
 
@@ -25,6 +26,7 @@ pub enum Token<'a> {
     TemplateEnd,
     LinkStart,
     LinkEnd,
+    /// Stores (name, is_self_closing)
     ElementStart(String, bool),
     ElementEnd(String),
     Content(&'a str),
@@ -156,7 +158,7 @@ fn parse_begin(i: &str) -> IResult<&str, Token> {
             ('"', _) => {
                 unclosed_quote = !unclosed_quote;
             }
-            _ => {},
+            _ => {}
         }
         if !is_space(c) {
             last = c;
@@ -166,9 +168,30 @@ fn parse_begin(i: &str) -> IResult<&str, Token> {
 }
 
 pub fn tokenize(text: &str) -> Result<Vec<Token>> {
-    let (_, tokens) = all_consuming(many0(parse_token))(text)
-        .map_err(|e| Error::from(ErrorKind::WikitextParseError(e.to_string())))?;
-    Ok(tokens)
+    let mut result = vec![];
+    let blocks = preprocess(text)?;
+    for block in blocks {
+        match block {
+            WikitextBlock::Verbatim { element_name, content } => {
+                result.push(Token::ElementStart(element_name.clone(), false));
+                result.push(Token::Content(content));
+                result.push(Token::ElementEnd(element_name));
+            },
+            WikitextBlock::Heading { level, content } => {
+                let (_, tokens) = all_consuming(many0(parse_token))(content)
+                    .map_err(|e| Error::from(ErrorKind::WikitextParseError(e.to_string())))?;
+                result.push(Token::ElementStart(format!("h{}", level), false));
+                result.extend(tokens);
+                result.push(Token::ElementEnd(format!("h{}", level)));
+            },
+            WikitextBlock::Body { content } => {
+                let (_, tokens) = all_consuming(many0(parse_token))(content)
+                    .map_err(|e| Error::from(ErrorKind::WikitextParseError(e.to_string())))?;
+                result.extend(tokens);
+            },
+        }
+    }
+    Ok(result)
 }
 
 struct WikiPageContext<'a> {
@@ -329,6 +352,165 @@ pub fn get_links(text: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
+enum WikitextBlock<'a> {
+    Verbatim {
+        element_name: String,
+        content: &'a str,
+    },
+    Heading {
+        level: usize,
+        content: &'a str,
+    },
+    Body {
+        content: &'a str,
+    },
+}
+
+fn preprocess(text: &str) -> Result<Vec<WikitextBlock>> {
+    let mut acc = vec![];
+    let mut open_tag = None;
+    let mut acced = 0;
+    let mut inp = text;
+    while !inp.is_empty() {
+        let len = inp.len();
+        let res = alt((
+            preceded(char('<'), parse_langle),
+            map(take_till1(|c| c == '<'), Token::Content),
+        ))(inp);
+        match res {
+            Err(e) => return Err(ErrorKind::WikitextParseError(e.to_string()).into()),
+            Ok((i1, tok)) => {
+                // infinite loop check: the parser must always consume
+                if i1.len() == len {
+                    return Err(ErrorKind::WikitextParseError(format!(
+                        "alt parser consumed nothing"
+                    ))
+                    .into());
+                }
+
+                match tok {
+                    Token::ElementStart(tag, false) if is_syntax_override(&tag) => {
+                        if open_tag.is_none() {
+                            let needs_acc = text.offset(inp);
+                            acc.push(WikitextBlock::Body {
+                                content: &text[acced..needs_acc],
+                            });
+                            open_tag = Some(tag);
+                            acced = text.offset(i1);
+                        }
+                    }
+                    Token::ElementEnd(tag) if is_syntax_override(&tag) => {
+                        if let Some(ot) = open_tag.take() {
+                            if tag == ot {
+                                let needs_acc = text.offset(inp);
+                                acc.push(WikitextBlock::Verbatim {
+                                    element_name: tag,
+                                    content: &text[acced..needs_acc],
+                                });
+                                acced = text.offset(i1);
+                            } else {
+                                open_tag = Some(ot)
+                            }
+                        } else {
+                            // interpret as self-closing tag
+                            let needs_acc = text.offset(inp);
+                            acc.push(WikitextBlock::Body {
+                                content: &text[acced..needs_acc],
+                            });
+                            acc.push(WikitextBlock::Verbatim {
+                                element_name: tag,
+                                content: Default::default(),
+                            });
+                            acced = text.offset(i1);
+                        }
+                    }
+                    _ => {}
+                }
+
+                inp = i1;
+            }
+        }
+    }
+    if let Some(ot) = open_tag {
+        acc.push(WikitextBlock::Verbatim {
+            element_name: ot,
+            content: &text[acced..],
+        });
+    } else {
+        acc.push(WikitextBlock::Body {
+            content: &text[acced..],
+        });
+    }
+
+    let result = acc
+        .into_iter()
+        .flat_map(|block| match block {
+            WikitextBlock::Verbatim { .. } => vec![block],
+            WikitextBlock::Heading { .. } => vec![block],
+            WikitextBlock::Body { content } => {
+                let mut blocks = vec![];
+                let mut blocked = 0;
+                let mut idx = 0;
+                for line in content.split_inclusive('\n') {
+                    let next_idx = idx + line.len();
+                    if let Some(rest) = line.strip_prefix("=").and_then(|s| s.strip_suffix("\n")) {
+                        let (leading, start_idx) = rest
+                            .as_bytes()
+                            .iter()
+                            .copied()
+                            .take_while(|&c| c == b'=' || c == b' ' || c == b'\t')
+                            .fold((1, 1), |(x, y), c| {
+                                if c == b'=' {
+                                    (x + 1, y + 1)
+                                } else {
+                                    (x, y + 1)
+                                }
+                            });
+                        if leading > rest.len() {
+                            idx = next_idx;
+                            continue;
+                        }
+
+                        let (trailing, end_idx) = line
+                            .as_bytes()
+                            .iter()
+                            .copied()
+                            .rev()
+                            .take_while(|&c| c == b'=' || c == b' ' || c == b'\t')
+                            .fold((0, line.len()), |(x, y), c| {
+                                if c == b'=' {
+                                    (x + 1, y - 1)
+                                } else {
+                                    (x, y - 1)
+                                }
+                            });
+                        if leading == trailing {
+                            if idx > blocked {
+                                blocks.push(WikitextBlock::Body {
+                                    content: &content[blocked..idx],
+                                });
+                            }
+                            blocks.push(WikitextBlock::Heading {
+                                level: leading,
+                                content: &line[start_idx..end_idx],
+                            });
+                            blocked = next_idx;
+                        }
+                        idx = next_idx;
+                    }
+                }
+                if blocked < content.len() {
+                    blocks.push(WikitextBlock::Body {
+                        content: &content[blocked..],
+                    });
+                }
+                blocks
+            }
+        })
+        .collect();
+    Ok(result)
+}
+
 struct TemplateIterator<'a, F>
 where
     F: Fn(&str) -> bool,
@@ -449,7 +631,8 @@ pub fn get_distinguish_hatnotes(text: &str) -> Result<Vec<String>> {
 
 pub fn get_templates_by_name(text: &str, names: Vec<String>) -> Result<Vec<String>> {
     let tokens = tokenize(text)?;
-    let mut tmpl_iter = TemplateIterator::new(tokens, |title| tmpl_title_is_in_names(title, &names));
+    let mut tmpl_iter =
+        TemplateIterator::new(tokens, |title| tmpl_title_is_in_names(title, &names));
     let mut result = vec![];
     while let Some(tmpl) = tmpl_iter.next() {
         if tmpl_iter.open_tmpls.iter().all(|e| e.is_none()) {
@@ -467,8 +650,10 @@ pub fn get_first_infobox_title(text: &str) -> Result<Option<String>> {
     while let Some(tmpl) = tmpl_iter.next() {
         if tmpl_iter.open_tmpls.iter().all(|e| e.is_none()) {
             let (title, _) = tmpl.split_once('|').unwrap_or((&tmpl, ""));
-            let title = title.get(8..).expect("(\"Infobox \" + c).get(8..) === Some(c)");
-            return Ok(Some(title.trim().to_string()))
+            let title = title
+                .get(8..)
+                .expect("(\"Infobox \" + c).get(8..) === Some(c)");
+            return Ok(Some(title.trim().to_string()));
         }
     }
     Ok(None)
