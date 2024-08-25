@@ -80,10 +80,6 @@ fn parse_name_lower(i: &str) -> IResult<&str, String> {
     map(parse_name, |s| s.to_ascii_lowercase())(i)
 }
 
-fn is_special(c: char) -> bool {
-    c == '<' || c == '{' || c == '}' || c == '[' || c == ']'
-}
-
 fn parse_content(inp: &str, is_line_start0: bool) -> IResult<&str, Vec<Token>> {
     let mut result = vec![];
     // offset by 1
@@ -117,21 +113,7 @@ fn parse_content(inp: &str, is_line_start0: bool) -> IResult<&str, Vec<Token>> {
         if c == ' ' || c == '\t' {
             continue;
         }
-        if c != '=' && buffer[0] == '=' {
-            let breakpoint = match buffer {
-                ['=', '\n', _, _, _, _] => Some(indices[0]),
-                ['=', '=', '\n', _, _, _] => Some(indices[1]),
-                ['=', '=', '=', '\n', _, _] => Some(indices[2]),
-                ['=', '=', '=', '=', '\n', _] => Some(indices[3]),
-                ['=', '=', '=', '=', '=', '\n'] => Some(indices[4]),
-                _ => None,
-            };
-            if let Some(hdr_start_start) = breakpoint {
-                result.push(Token::Content(&inp[resulted..hdr_start_start - 1]));
-                result.push(Token::HeaderStart(&inp[hdr_start_start - 1..i]));
-                resulted = i;
-            }
-        } else if c == '\n' && buffer[0] == '=' {
+        if c == '\n' && buffer[0] == '=' {
             let breakpoint = match buffer {
                 ['=', '=', '=', '=', '=', _] => Some(indices[4]),
                 ['=', '=', '=', '=', _, _] => Some(indices[3]),
@@ -143,6 +125,20 @@ fn parse_content(inp: &str, is_line_start0: bool) -> IResult<&str, Vec<Token>> {
             if let Some(hdr_end_start) = breakpoint {
                 result.push(Token::Content(&inp[resulted..hdr_end_start - 1]));
                 result.push(Token::HeaderEnd(&inp[hdr_end_start - 1..i]));
+                resulted = i;
+            }
+        } else if c != '=' && buffer[0] == '=' {
+            let breakpoint = match buffer {
+                ['=', '\n', _, _, _, _] => Some(indices[0]),
+                ['=', '=', '\n', _, _, _] => Some(indices[1]),
+                ['=', '=', '=', '\n', _, _] => Some(indices[2]),
+                ['=', '=', '=', '=', '\n', _] => Some(indices[3]),
+                ['=', '=', '=', '=', '=', '\n'] => Some(indices[4]),
+                _ => None,
+            };
+            if let Some(hdr_start_start) = breakpoint {
+                result.push(Token::Content(&inp[resulted..hdr_start_start - 1]));
+                result.push(Token::HeaderStart(&inp[hdr_start_start - 1..i]));
                 resulted = i;
             }
         }
