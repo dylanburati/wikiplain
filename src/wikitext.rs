@@ -4,14 +4,10 @@ use std::{
     iter::Peekable,
 };
 
+use itertools::Itertools;
 use lazy_static::lazy_static;
 use nom::{
-    branch::alt,
-    bytes::complete::{tag, take_till, take_till1, take_until, take_while},
-    character::complete::char,
-    combinator::{fail, map, map_opt, value},
-    sequence::{delimited, preceded, terminated},
-    IResult, InputIter,
+    branch::alt, bytes::complete::{tag, take_till, take_till1, take_until, take_while}, character::complete::char, combinator::{fail, map, map_opt, value}, sequence::{delimited, preceded, terminated}, AsBytes, IResult, InputIter
 };
 use regex::Regex;
 
@@ -220,9 +216,117 @@ fn parse_begin(i: &str) -> IResult<&str, Token> {
     fail("")
 }
 
-pub fn tokenize(text: &str) -> Result<Vec<Token>> {
-    let mut is_start = true;
+pub fn get_headings(text: &str) -> Result<Vec<(&str, usize)>> {
     let mut acc = vec![];
+    for line in text.split('\n') {
+        if let Some(rest) = line.strip_prefix("=") {
+            let (leading, start_idx) = rest.as_bytes().iter().take_while(|c| c == b'=' || c == b' ' || c == b'\t')
+                .fold((1, 1), |(x, y), c| if c == b'=' {
+                    (x+1, y+1)
+                } else {
+                    (x, y+1)
+                });
+            if leading < line.len() {
+                let (trailing, end_idx) = line.as_bytes().iter().rev().take_while(c == b'=' || c == b' ' || c == b'\t')
+                    .fold((0, line.len()), |(x, y), c| if c == b'=' {
+                        (x+1, y-1)
+                    } else {
+                        (x, y-1)
+                    });
+
+                if leading == trailing {
+                    acc.push((&line[start_idx..end_idx], leading))
+                }
+            }
+        }
+    }
+    Ok(acc)
+}
+
+pub fn tokenize(text: &str) -> Result<Vec<Token>> {
+    let mut acc = vec![];
+    let mut all_lines_iterator = text.iter_indices()
+        .scan(0, |state, (byte_offset, ch)| {
+            let line_num = *state;
+            if ch == '\n' {
+                *state += 1;
+            }
+            Some((line_num, byte_offset, ch))
+        })
+        .peekable();
+    let line_start_indices = vec![];
+    let mut leading_equals = vec![];
+    let mut trailing_equals = vec![];
+    let mut line_num = 0;
+    loop {
+        let line_iterator = all_lines_iterator.peeking_take_while(|(l, _, _)| l == line_num);
+        let line_data = line_iterator.fold(None, |st, (_, byte_offset, ch)| {
+            match st {
+                // (byte_offset, len leading '=' streak, leading streak ended, len current '=' streak if not leading)
+                None => Some((byte_offset, usize::from(ch == '='), false, 0)),
+                Some((_, 0, _, _)) => st,
+                Some((idx, leading, false, _)) => match ch {
+                    '=' => Some((idx, leading+1, false, 0)),
+                    ' ' | '\t' => st,
+                    _ => Some((idx, leading, true, 0)),
+                }
+                Some((idx, leading, true, curr)) => match ch {
+                    '=' => Some((idx, leading, true, curr+1)),
+                    ' ' | '\t' => st,
+                    _ => Some((idx, leading, true, 0)),
+                }
+            }
+        });
+        let Some(())
+    }
+    
+    let mut line = 0;
+    let mut eq_streak = 0;
+    let mut all_eq = true;
+    for (curr_line, byte_offset, ch) in line_iterator {
+        if curr_line != line {
+            if leading_equals.len() < curr_line {
+                leading_equals.push(0);
+                trailing_equals.push(0);
+            } else {
+                trailing_equals.push(eq_streak);
+            }
+            line = curr_line;
+            eq_streak = 0;
+            all_eq = true;
+            line_start_indices.push(byte_offset);
+        }
+
+        if ch.is_space() {
+            continue;
+        }
+        if ch == '=' {
+            eq_streak += 1;
+        } else {
+            if leading_equals.len() < line+1 {
+                leading_equals.push(eq_streak);
+            }
+            eq_streak = 0;
+        }
+    }
+    
+
+    let mut last = '\n';
+    loop {
+        let mut ct = 0;
+        let mut ended = false;
+        while let Some((i, c)) = iterator.next() {
+            if c == '=' {
+                ct += 1;
+            }
+            if ct > 0 && (c == ' ' || c == '\t') {
+                continue;
+            }
+            ended = c == '\n';
+            break;
+        }
+
+
     let mut i = text;
     while !i.is_empty() {
         let len = text.len();

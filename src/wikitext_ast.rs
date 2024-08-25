@@ -117,7 +117,7 @@ fn parse_any_for_structure<'a>(
                 parse_structure(i, unclosed).map_within(|n| vec![n])
             }
             (false, Token::TemplateEnd | Token::LinkEnd | Token::HeaderEnd(_)) => {
-                Err(ErrorKind::ASTParseError("parse_any_for_structure".into(), i.len()).into())
+                Err(ErrorKind::ASTParseError(format!("parse_any_for_structure first={:?}", first), i.len()).into())
             }
             (_, Token::ElementStart(_, _)) => parse_structure(i, unclosed).map_within(|n| vec![n]),
             (_, Token::ElementEnd(name)) => match name.as_str() {
@@ -128,7 +128,7 @@ fn parse_any_for_structure<'a>(
                     vec![Node::Element(name.to_owned(), vec![])],
                 )),
                 _ => {
-                    Err(ErrorKind::ASTParseError("parse_any_for_structure".into(), i.len()).into())
+                    Err(ErrorKind::ASTParseError(format!("parse_any_for_structure first={:?}", first), i.len()).into())
                 }
             },
             _ => parse_content(i, unclosed, overridden).map_within(|strings| {

@@ -2349,6 +2349,7 @@ dependencies = [
  "bzip2",
  "crossbeam",
  "error-chain",
+ "itertools",
  "lazy_static",
  "nom 7.1.3",
  "nom-sql",
