@@ -69,14 +69,6 @@ fn is_invalid_for_xml_name(c: char) -> bool {
     }
 }
 
-// fn is_invalid_for_xml_ident(c: char) -> bool {
-//     is_invalid_for_xml_name(c) || c == ':'
-// }
-
-// fn parse_ident(i: &str) -> IResult<&str, &str> {
-//     take_till1(is_invalid_for_xml_ident)(i)
-// }
-
 fn parse_name(i: &str) -> IResult<&str, &str> {
     take_till1(is_invalid_for_xml_name)(i)
 }
@@ -145,27 +137,29 @@ fn parse_begin(i: &str) -> IResult<&str, Token> {
     let (rest, name) = map_opt(parse_name_lower, |n| {
         Some(n).filter(|it| validate_name(it.as_str()))
     })(i)?;
-    let mut st = ('\0', false);
+    let mut last = '\0';
+    let mut unclosed_quote = false;
     for (i, c) in rest.iter_indices() {
-        match (c, st.1) {
+        match (c, unclosed_quote) {
             ('>', false) => unsafe {
                 // safety: iter_indices `i` is in bounds and at a utf-8 boundary. '<' is one byte,
                 // so i+1 will be a utf-8 boundary unless `i` is the last index. In that case,
                 // s[s.len()..] is also a valid zero-length slice
                 let rest2 = rest.get_unchecked(i + 1..);
-                return Ok((rest2, Token::ElementStart(name, st.0 == '/')));
+                return Ok((rest2, Token::ElementStart(name, last == '/')));
             },
             ('<', false) => unsafe {
                 // safety: iter_indices `i` is in bounds and at a utf-8 boundary
                 let rest2 = rest.get_unchecked(i..);
-                return Ok((rest2, Token::ElementStart(name, st.0 == '/')));
+                return Ok((rest2, Token::ElementStart(name, last == '/')));
             },
-            ('"', b) => st = ('"', !b),
-            (ch, _) => {
-                if !is_space(ch) {
-                    st = (ch, st.1)
-                }
+            ('"', _) => {
+                unclosed_quote = !unclosed_quote;
             }
+            _ => {},
+        }
+        if !is_space(c) {
+            last = c;
         }
     }
     fail("")
@@ -453,6 +447,18 @@ pub fn get_distinguish_hatnotes(text: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
+pub fn get_templates_by_name(text: &str, names: Vec<String>) -> Result<Vec<String>> {
+    let tokens = tokenize(text)?;
+    let mut tmpl_iter = TemplateIterator::new(tokens, |title| tmpl_title_is_in_names(title, &names));
+    let mut result = vec![];
+    while let Some(tmpl) = tmpl_iter.next() {
+        if tmpl_iter.open_tmpls.iter().all(|e| e.is_none()) {
+            result.push(tmpl);
+        }
+    }
+    Ok(result)
+}
+
 pub fn get_first_infobox_title(text: &str) -> Result<Option<String>> {
     let tokens = tokenize(text)?;
     let mut tmpl_iter = TemplateIterator::new(tokens, |title| {
@@ -651,6 +657,14 @@ fn parse_tmpl_title(i: &str) -> IResult<&str, String> {
         }
     }
     Ok((rest, title_s))
+}
+
+fn tmpl_title_is_in_names(title: &str, names: &[String]) -> bool {
+    if let Ok((_, title_u1)) = parse_tmpl_title(title) {
+        names.contains(&title_u1)
+    } else {
+        false
+    }
 }
 
 fn is_distinguish_hatnote(title: &str) -> bool {

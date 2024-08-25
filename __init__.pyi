@@ -63,3 +63,8 @@ def get_distinguish_hatnotes(text: str) -> list[str]:
 
 def get_first_infobox_title(text: str) -> str | None:
     """Get the title of the first infobox template in the Wikitext, or None if not found."""
+
+def get_templates_by_name(text: str, names: list[str]) -> list[str]:
+    """Get the full template content for each template with one of the given names (first character
+    must be capitalized).
+    """

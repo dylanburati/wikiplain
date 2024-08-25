@@ -302,6 +302,13 @@ fn get_first_infobox_title(text: &str) -> PyResult<Option<String>> {
     wikitext::get_first_infobox_title(text).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+/// Get the full template content for each template with one of the given names (first character
+/// must be capitalized).
+#[pyfunction]
+fn get_templates_by_name(text: &str, names: Vec<String>) -> PyResult<Vec<String>> {
+    wikitext::get_templates_by_name(text, names).map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
 fn sql_module(py: Python, parent_module: &PyModule) -> PyResult<()> {
     let m = PyModule::new(py, "sql")?;
     m.add_function(wrap_pyfunction!(parse_sql_insert_statement, m)?)?;
@@ -326,6 +333,7 @@ fn wikiplain(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_disambiguation_page, m)?)?;
     m.add_function(wrap_pyfunction!(get_distinguish_hatnotes, m)?)?;
     m.add_function(wrap_pyfunction!(get_first_infobox_title, m)?)?;
+    m.add_function(wrap_pyfunction!(get_templates_by_name, m)?)?;
     sql_module(py, m)?;
     Ok(())
 }
