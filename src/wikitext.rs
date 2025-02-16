@@ -15,7 +15,6 @@ use nom::{
     IResult, InputIter, Offset,
 };
 use regex::Regex;
-use tantivy::HasLen;
 
 use crate::{Error, ErrorKind, Result};
 
@@ -79,13 +78,51 @@ fn parse_name_lower(i: &str) -> IResult<&str, String> {
     map(parse_name, |s| s.to_ascii_lowercase())(i)
 }
 
-fn is_special(c: char) -> bool {
-    c == '<' || c == '{' || c == '}' || c == '[' || c == ']'
+fn parse_content(inp: &str) -> IResult<&str, Token> {
+    let len = inp.len();
+    if len == 0 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            inp,
+            nom::error::ErrorKind::TakeWhile1,
+        )));
+    }
+    let mut prev = '\0';
+    for (i, c) in inp.iter_indices() {
+        let breakpoint = match c {
+            '<' => {
+                if i > 0 {
+                    Some(i)
+                } else {
+                    // already failed to parse this as an element; default to content
+                    None
+                }
+            }
+            '{' | '}' | '[' | ']' => {
+                if prev == c {
+                    Some(i - 1)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(consumed) = breakpoint {
+            if consumed == 0 {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    inp,
+                    nom::error::ErrorKind::TakeWhile1,
+                )));
+            }
+            let tok = Token::Content(&inp[..consumed]);
+            return Ok((&inp[consumed..], tok));
+        }
+        prev = c;
+    }
+
+    let tok = Token::Content(&inp[..len]);
+    return Ok((&inp[len..], tok));
 }
 
-fn parse_content(i: &str) -> IResult<&str, &str> {
-    take_till(is_special)(i)
-}
 
 fn parse_token(i: &str) -> IResult<&str, Token> {
     alt((
@@ -94,7 +131,7 @@ fn parse_token(i: &str) -> IResult<&str, Token> {
         map(tag("}}"), |_| Token::TemplateEnd),
         map(tag("[["), |_| Token::LinkStart),
         map(tag("]]"), |_| Token::LinkEnd),
-        map(recognize(preceded(anychar, parse_content)), Token::Content),
+        parse_content,
     ))(i)
 }
 
@@ -375,7 +412,7 @@ fn preprocess(text: &str) -> Result<Vec<WikitextBlock>> {
         let len = inp.len();
         let res = alt((
             preceded(char('<'), parse_langle),
-            map(take_till1(|c| c == '<'), Token::Content),
+            map(recognize(preceded(anychar, take_till(|c| c == '<'))), Token::Content),
         ))(inp);
         match res {
             Err(e) => return Err(ErrorKind::WikitextParseError(e.to_string()).into()),
@@ -459,45 +496,42 @@ fn preprocess(text: &str) -> Result<Vec<WikitextBlock>> {
                             .iter()
                             .copied()
                             .take_while(|&c| c == b'=' || c == b' ' || c == b'\t')
-                            .fold((1, 1), |(x, y), c| {
+                            .fold((1, 0), |(x, y), c| {
                                 if c == b'=' {
                                     (x + 1, y + 1)
                                 } else {
                                     (x, y + 1)
                                 }
                             });
-                        if leading > rest.len() {
-                            idx = next_idx;
-                            continue;
-                        }
-
-                        let (trailing, end_idx) = line
-                            .as_bytes()
-                            .iter()
-                            .copied()
-                            .rev()
-                            .take_while(|&c| c == b'=' || c == b' ' || c == b'\t')
-                            .fold((0, line.len()), |(x, y), c| {
-                                if c == b'=' {
-                                    (x + 1, y - 1)
-                                } else {
-                                    (x, y - 1)
-                                }
-                            });
-                        if leading == trailing {
-                            if idx > blocked {
-                                blocks.push(WikitextBlock::Body {
-                                    content: &content[blocked..idx],
+                        if start_idx < rest.len() {
+                            let (trailing, end_idx) = rest
+                                .as_bytes()
+                                .iter()
+                                .copied()
+                                .rev()
+                                .take_while(|&c| c == b'=' || c == b' ' || c == b'\t')
+                                .fold((0, rest.len()), |(x, y), c| {
+                                    if c == b'=' {
+                                        (x + 1, y - 1)
+                                    } else {
+                                        (x, y - 1)
+                                    }
                                 });
+                            if leading == trailing {
+                                if idx > blocked {
+                                    blocks.push(WikitextBlock::Body {
+                                        content: &content[blocked..idx],
+                                    });
+                                }
+                                blocks.push(WikitextBlock::Heading {
+                                    level: leading,
+                                    content: &rest[start_idx..end_idx],
+                                });
+                                blocked = next_idx;
                             }
-                            blocks.push(WikitextBlock::Heading {
-                                level: leading,
-                                content: &line[start_idx..end_idx],
-                            });
-                            blocked = next_idx;
                         }
-                        idx = next_idx;
                     }
+                    idx = next_idx;
                 }
                 if blocked < content.len() {
                     blocks.push(WikitextBlock::Body {
