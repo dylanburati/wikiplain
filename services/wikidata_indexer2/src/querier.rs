@@ -50,11 +50,37 @@ impl<'a> WikidataNode<'a> {
 
 #[repr(C)]
 #[repr(packed(4))]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct WikidataLeaf(u64, u64, u32);
 
 impl WikidataLeaf {
     #[cfg(target_endian = "little")]
-    fn key(&self) -> u64 {
+    pub(crate) fn new(key: u64, offset: u64, length: u32) -> Self {
+        Self(key, offset, length)
+    }
+
+    #[cfg(target_endian = "big")]
+    pub(crate) fn new(key: u64, offset: u64, length: u32) -> Self {
+        Self(key.swap_bytes(), offset.swap_bytes(), length.swap_bytes())
+    }
+
+    #[rustfmt::skip]
+    pub(crate) fn to_le_bytes(&self) -> [u8; 20] {
+        // to_ne_bytes is used because the in-memory fields
+        // are little-endian
+        let key_b = self.0.to_ne_bytes();
+        let off_b = self.1.to_ne_bytes();
+        let len_b = self.2.to_ne_bytes();
+
+        [
+            key_b[0], key_b[1], key_b[2], key_b[3], key_b[4], key_b[5], key_b[6], key_b[7],
+            off_b[0], off_b[1], off_b[2], off_b[3], off_b[4], off_b[5], off_b[6], off_b[7],
+            len_b[0], len_b[1], len_b[2], len_b[3],
+        ]
+    }
+
+    #[cfg(target_endian = "little")]
+    pub(crate) fn key(&self) -> u64 {
         self.0
     }
 
@@ -64,7 +90,7 @@ impl WikidataLeaf {
     }
 
     #[cfg(target_endian = "little")]
-    fn data_offset(&self) -> u64 {
+    pub(crate) fn data_offset(&self) -> u64 {
         self.1
     }
 
@@ -74,7 +100,7 @@ impl WikidataLeaf {
     }
 
     #[cfg(target_endian = "little")]
-    fn data_length(&self) -> u32 {
+    pub(crate) fn data_length(&self) -> u32 {
         self.2
     }
 
