@@ -248,7 +248,7 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
         .read(true)
         .write(true)
         .truncate(true)
-        .open(working_path_secondary)?;
+        .open(&working_path_secondary)?;
 
     let (dict_consumer, dict_supplier) = sync_channel::<Result<Vec<u8>>>(4);
     std::thread::scope(|s| -> Result<()> {
@@ -296,7 +296,7 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
         let stg_secondary_bytes = unsafe { Mmap::map(&segmented.file_stg_secondary) }?;
         let mut stg_secondary_offset = 0;
         let stride = std::mem::size_of::<(u64, u64)>();
-        while stg_secondary_offset < stg_secondary_bytes.len() {
+        while (stg_secondary_offset + stride * STG_BLOCK_LIMIT) <= stg_secondary_bytes.len() {
             let entry_chunk: &[(u64, u64)] = unsafe {
                 std::slice::from_raw_parts(
                     std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
@@ -317,6 +317,7 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
         Ok(())
     })?;
     std::fs::remove_file(working_path)?;
+    std::fs::remove_file(working_path_secondary)?;
     Ok(())
 }
 
@@ -402,7 +403,10 @@ fn write_segmented(
     let mut group_offsets = vec![];
     let mut compressed_buf = Vec::with_capacity(1024 * 1024);
 
-    let lines_lazy_iterable = input.split(b'\n').chunks(100);
+    const LINES_PER_CHUNK: usize = 200;
+    assert_eq!(ENTITIES_PER_CDICT % LINES_PER_CHUNK, 0);
+
+    let lines_lazy_iterable = input.split(b'\n').chunks(LINES_PER_CHUNK);
     let mut lines_lazy_iter = lines_lazy_iterable.into_iter();
     while !eof {
         let next_group_start = entity_number + ENTITIES_PER_CDICT as u64;
@@ -410,7 +414,7 @@ fn write_segmented(
         let cdict_size = cdict_bytes.len() as u32;
         output_dicts.write_all(&cdict_size.to_le_bytes())?;
         output_dicts.write_all(&cdict_bytes)?;
-        let cdict = EncoderDictionary::copy(&cdict_bytes, 3);
+        let cdict = EncoderDictionary::copy(&cdict_bytes, 5);
         group_offsets.push(compressed_offset);
 
         while entity_number < next_group_start {
@@ -429,7 +433,7 @@ fn write_segmented(
                 })
                 .collect();
             let entities: Vec<(&[u8], WikidataEntity)> = entity_results.into_iter().try_fold(
-                Vec::with_capacity(100),
+                Vec::with_capacity(LINES_PER_CHUNK),
                 |mut acc, res| -> Result<_> {
                     let (json, ent_raw) = res?;
                     let ent = ent_raw.try_into()?;
@@ -487,6 +491,20 @@ fn write_segmented(
                 output_stg_secondary.write_all(&eid.to_le_bytes())?;
             }
             prop_staged_count += STG_BLOCK_LIMIT as u64;
+            let _ = file_stg_secondary.insert(
+                output_stg_secondary
+                    .into_inner()
+                    .map_err(std::io::Error::from)?,
+            );
+        }
+        // FIXME
+        if eof && prop_ind_entries.len() > 0 {
+            let mut output_stg_secondary =
+                BufWriter::with_capacity(131072, file_stg_secondary.take().unwrap());
+            for (k, eid) in prop_ind_entries.iter() {
+                output_stg_secondary.write_all(&k.to_le_bytes())?;
+                output_stg_secondary.write_all(&eid.to_le_bytes())?;
+            }
             let _ = file_stg_secondary.insert(
                 output_stg_secondary
                     .into_inner()
@@ -684,7 +702,7 @@ pub fn write_prop_index<W: Write + Seek>(
             prop_card = 0;
             if !entity_ids.is_empty() {
                 offset += std::mem::size_of_val(&entity_ids[..]) as u64;
-                for v in &entity_ids {
+                for v in entity_ids.iter() {
                     output.write_all(&v.to_le_bytes())?;
                 }
                 entity_ids.clear();
