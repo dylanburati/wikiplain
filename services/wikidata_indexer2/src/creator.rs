@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -419,7 +420,7 @@ fn write_segmented(
         let cdict_size = cdict_bytes.len() as u32;
         output_dicts.write_all(&cdict_size.to_le_bytes())?;
         output_dicts.write_all(&cdict_bytes)?;
-        let cdict = EncoderDictionary::copy(&cdict_bytes, 3);
+        let cdict = EncoderDictionary::copy(&cdict_bytes, 4);
         let guard = output_plain.lock().unwrap();
         let (compressed_offset, _) = guard.deref();
         group_offsets.push(*compressed_offset);
@@ -609,7 +610,7 @@ pub fn write_index<W: Write + Seek>(
     let mut merge_queue = BinaryHeap::new();
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(item) = reader.next() {
-            merge_queue.push((item, i));
+            merge_queue.push(Reverse((item, i)));
         }
     }
     let mut ind_size = 0;
@@ -617,7 +618,7 @@ pub fn write_index<W: Write + Seek>(
     let mut level_pointers = vec![];
     let leaf_level_desc = level_descriptions.last().unwrap();
     while !merge_queue.is_empty() {
-        let (item, i) = merge_queue.pop().unwrap();
+        let Reverse((item, i)) = merge_queue.pop().unwrap();
         if leaf_level_desc.is_child_first_in_node(ind_size) {
             level_keys.push(item.key());
             level_pointers.push(offset);
@@ -627,7 +628,7 @@ pub fn write_index<W: Write + Seek>(
         ind_size += 1;
 
         if let Some(item) = readers[i].next() {
-            merge_queue.push((item, i));
+            merge_queue.push(Reverse((item, i)));
         }
     }
 
@@ -695,7 +696,7 @@ pub fn write_prop_index<W: Write + Seek>(
     let mut merge_queue = BinaryHeap::new();
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(item) = reader.next() {
-            merge_queue.push((item, i));
+            merge_queue.push(Reverse((item, i)));
         }
     }
     let mut ent_list_offsets: Vec<u64> = vec![offset];
@@ -703,7 +704,7 @@ pub fn write_prop_index<W: Write + Seek>(
     let mut prop_card: u64 = 0;
     let mut last_prop_id = (b'P' as u64) << ENTITY_KIND_SHIFT;
     while !merge_queue.is_empty() {
-        let ((prop_id, ent_id), i) = merge_queue.pop().unwrap();
+        let Reverse(((prop_id, ent_id), i)) = merge_queue.pop().unwrap();
         while last_prop_id < *prop_id {
             ent_list_offsets.push(offset);
             prop_cardinalities.push(prop_card);
@@ -716,7 +717,7 @@ pub fn write_prop_index<W: Write + Seek>(
         prop_card += 1;
 
         if let Some(item) = readers[i].next() {
-            merge_queue.push((item, i));
+            merge_queue.push(Reverse((item, i)));
         }
     }
     prop_cardinalities.push(prop_card);
@@ -855,7 +856,11 @@ mod tests {
     fn write_index_two_levels() -> super::Result<()> {
         let ind_entries: Vec<_> = (1u64..=601).map(|k| WikidataLeaf::new(k, k + 64, 1u32)).collect();
         let group_offsets = vec![0, 1000, 2000, 3000];
-        let actual = super::write_index(vec![&ind_entries], group_offsets, std::io::Cursor::new(Vec::new()))?.into_inner();
+        let actual = super::write_index(
+            vec![&ind_entries[..200], &ind_entries[200..400], &ind_entries[400..]],
+            group_offsets,
+            std::io::Cursor::new(Vec::new()),
+        )?.into_inner();
         let ir = IndexReader::new(&actual);
         let n_groups = ir.n_groups();
         assert_eq!(n_groups, 4);
