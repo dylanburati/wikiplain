@@ -1,12 +1,15 @@
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::{Deref, DerefMut};
 use std::result::Result as StdResult;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use flate2::read::MultiGzDecoder;
 use itertools::Itertools;
 use memmap2::Mmap;
+use object_pool::Pool;
 use rand::Rng;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -111,9 +114,7 @@ impl LevelDesc {
     }
 
     fn total_children(&self) -> u64 {
-        self.width.saturating_sub(2) * TREE_FANOUT
-            + self.children1 as u64
-            + self.children2 as u64
+        self.width.saturating_sub(2) * TREE_FANOUT + self.children1 as u64 + self.children2 as u64
     }
 
     fn node_sizes(&self) -> impl Iterator<Item = u32> {
@@ -143,7 +144,11 @@ impl LevelDesc {
         }
         let remainder = (total % TREE_FANOUT) as u32;
         if remainder == 0 {
-            let children2 = if full_nodes == 1 { 0 } else { TREE_FANOUT as u32 };
+            let children2 = if full_nodes == 1 {
+                0
+            } else {
+                TREE_FANOUT as u32
+            };
             return Self::new(full_nodes, TREE_FANOUT as u32, children2);
         }
         let children1 = (TREE_FANOUT as u32 + remainder) / 2;
@@ -250,71 +255,72 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
         .truncate(true)
         .open(&working_path_secondary)?;
 
-    let (dict_consumer, dict_supplier) = sync_channel::<Result<Vec<u8>>>(4);
+    let (dict_sender, dict_receiver) = sync_channel::<Vec<u8>>(4);
     std::thread::scope(|s| -> Result<()> {
-        s.spawn(
-            || match get_zstd_dicts(file_input2, dict_consumer.clone()) {
-                Ok(_) => {}
-                Err(e) => dict_consumer.send(Err(e)).unwrap(),
-            },
+        let dict_producer_thread = s.spawn(
+            || get_zstd_dicts(file_input2, dict_sender.clone())
         );
 
-        let mut segmented = write_segmented(
-            file_input,
-            file_output,
-            file_dicts,
-            file_en,
-            file_stg,
-            file_stg_secondary,
-            dict_supplier,
-        )?;
-        segmented.ind_entries.sort();
-        let mut stg_entries = vec![segmented.ind_entries.as_slice()];
-        let stg_bytes = unsafe { Mmap::map(&segmented.file_stg) }?;
-        let mut stg_offset = 0;
-        let stride = std::mem::size_of::<WikidataLeaf>();
-        while stg_offset < stg_bytes.len() {
-            let entry_chunk: &[WikidataLeaf] = unsafe {
-                std::slice::from_raw_parts(
-                    std::mem::transmute(stg_bytes.as_ptr().add(stg_offset)),
-                    STG_BLOCK_LIMIT,
-                )
-            };
-            stg_entries.push(entry_chunk);
-            stg_offset += stride * STG_BLOCK_LIMIT;
-        }
-        let file_ind = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(output_index_path)?;
-        let _ = write_index(stg_entries, segmented.group_offsets, file_ind)?;
-        drop(stg_bytes);
+        let writer_thread = s.spawn(|| -> Result<()> {
+            let mut segmented = write_segmented(
+                file_input,
+                file_output,
+                file_dicts,
+                file_en,
+                file_stg,
+                file_stg_secondary,
+                dict_receiver,
+            )?;
+            segmented.ind_entries.sort();
+            let mut stg_entries = vec![segmented.ind_entries.as_slice()];
+            let stg_bytes = unsafe { Mmap::map(&segmented.file_stg) }?;
+            let mut stg_offset = 0;
+            let stride = std::mem::size_of::<WikidataLeaf>();
+            while stg_offset < stg_bytes.len() {
+                let entry_chunk: &[WikidataLeaf] = unsafe {
+                    std::slice::from_raw_parts(
+                        std::mem::transmute(stg_bytes.as_ptr().add(stg_offset)),
+                        STG_BLOCK_LIMIT,
+                    )
+                };
+                stg_entries.push(entry_chunk);
+                stg_offset += stride * STG_BLOCK_LIMIT;
+            }
+            let file_ind = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(output_index_path)?;
+            let _ = write_index(stg_entries, segmented.group_offsets, file_ind)?;
+            drop(stg_bytes);
 
-        segmented.prop_ind_entries.sort();
-        let mut stg_secondary_entries = vec![segmented.prop_ind_entries.as_slice()];
-        let stg_secondary_bytes = unsafe { Mmap::map(&segmented.file_stg_secondary) }?;
-        let mut stg_secondary_offset = 0;
-        let stride = std::mem::size_of::<(u64, u64)>();
-        while (stg_secondary_offset + stride * STG_BLOCK_LIMIT) <= stg_secondary_bytes.len() {
-            let entry_chunk: &[(u64, u64)] = unsafe {
-                std::slice::from_raw_parts(
-                    std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
-                    STG_BLOCK_LIMIT,
-                )
-            };
-            stg_secondary_entries.push(entry_chunk);
-            stg_secondary_offset += stride * STG_BLOCK_LIMIT;
-        }
-        let file_prop_ind = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(output_prop_index_path)?;
-        let _ = write_prop_index(stg_secondary_entries, segmented.prop_max_id, file_prop_ind)?;
-        drop(stg_secondary_bytes);
+            segmented.prop_ind_entries.sort();
+            let mut stg_secondary_entries = vec![segmented.prop_ind_entries.as_slice()];
+            let stg_secondary_bytes = unsafe { Mmap::map(&segmented.file_stg_secondary) }?;
+            let mut stg_secondary_offset = 0;
+            let stride = std::mem::size_of::<(u64, u64)>();
+            while (stg_secondary_offset + stride * STG_BLOCK_LIMIT) <= stg_secondary_bytes.len() {
+                let entry_chunk: &[(u64, u64)] = unsafe {
+                    std::slice::from_raw_parts(
+                        std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
+                        STG_BLOCK_LIMIT,
+                    )
+                };
+                stg_secondary_entries.push(entry_chunk);
+                stg_secondary_offset += stride * STG_BLOCK_LIMIT;
+            }
+            let file_prop_ind = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(output_prop_index_path)?;
+            let _ = write_prop_index(stg_secondary_entries, segmented.prop_max_id, file_prop_ind)?;
+            drop(stg_secondary_bytes);
+            Ok(())
+        });
 
-        Ok(())
+        writer_thread.join().unwrap()?;
+        dict_producer_thread.join().unwrap()
     })?;
     std::fs::remove_file(working_path)?;
     std::fs::remove_file(working_path_secondary)?;
@@ -322,7 +328,7 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
 }
 
 /// STEP 0: train the compressor and create a dictionary which will be shared for all items
-fn get_zstd_dicts(file_input: File, dict_consumer: SyncSender<Result<Vec<u8>>>) -> Result<()> {
+fn get_zstd_dicts(file_input: File, dict_sender: SyncSender<Vec<u8>>) -> Result<()> {
     let mut input = MultiGzDecoder::new(file_input);
     // Skip "[\n", then buffer starting from the first object / second line
     let mut array_start_buf = [0u8; 2];
@@ -361,7 +367,7 @@ fn get_zstd_dicts(file_input: File, dict_consumer: SyncSender<Result<Vec<u8>>>) 
         }
 
         let cdict_bytes = zstd::dict::from_samples(&reservoir, CDICT_SIZE)?;
-        dict_consumer.send(Ok(cdict_bytes)).unwrap();
+        dict_sender.send(cdict_bytes).map_err(|_| Error::from(ErrorKind::Msg(format!("send failed"))))?;
     }
     Ok(())
 }
@@ -377,10 +383,10 @@ fn write_segmented(
     file_en: File,
     file_stg: File,
     file_stg_secondary: File,
-    dict_supplier: Receiver<Result<Vec<u8>>>,
+    dict_receiver: Receiver<Vec<u8>>,
 ) -> Result<Segmented> {
     let mut input = MultiGzDecoder::new(file_input);
-    let mut output_plain = BufWriter::with_capacity(131072, file_output);
+    let output_plain = Arc::new(Mutex::new((0u64, BufWriter::with_capacity(131072, file_output))));
     let mut output_dicts = BufWriter::with_capacity(131072, file_output_dicts);
     let mut output_en = BufWriter::with_capacity(131072, file_en);
     let mut file_stg = Some(file_stg);
@@ -399,23 +405,25 @@ fn write_segmented(
     let mut prop_staged_count: u64 = 0;
     let mut prop_max_id: u64 = 0;
     let mut entity_number: u64 = 0;
-    let mut compressed_offset: u64 = 0;
     let mut group_offsets = vec![];
-    let mut compressed_buf = Vec::with_capacity(1024 * 1024);
 
     const LINES_PER_CHUNK: usize = 200;
     assert_eq!(ENTITIES_PER_CDICT % LINES_PER_CHUNK, 0);
+    let buffers = Pool::new(LINES_PER_CHUNK, || Vec::with_capacity(1024 * 1024));
 
     let lines_lazy_iterable = input.split(b'\n').chunks(LINES_PER_CHUNK);
     let mut lines_lazy_iter = lines_lazy_iterable.into_iter();
     while !eof {
         let next_group_start = entity_number + ENTITIES_PER_CDICT as u64;
-        let cdict_bytes = dict_supplier.recv().unwrap()?;
+        let cdict_bytes = dict_receiver.recv().unwrap();
         let cdict_size = cdict_bytes.len() as u32;
         output_dicts.write_all(&cdict_size.to_le_bytes())?;
         output_dicts.write_all(&cdict_bytes)?;
-        let cdict = EncoderDictionary::copy(&cdict_bytes, 5);
-        group_offsets.push(compressed_offset);
+        let cdict = EncoderDictionary::copy(&cdict_bytes, 3);
+        let guard = output_plain.lock().unwrap();
+        let (compressed_offset, _) = guard.deref();
+        group_offsets.push(*compressed_offset);
+        drop(guard);
 
         while entity_number < next_group_start {
             let Some(lines_lazy) = lines_lazy_iter.next() else {
@@ -423,7 +431,7 @@ fn write_segmented(
                 break;
             };
             let lines = lines_lazy.collect::<StdResult<Vec<_>, _>>()?;
-            let entity_results: Vec<_> = lines
+            let entity_results = lines
                 .par_iter()
                 .filter(|line| line.starts_with(b"{"))
                 .map(|line| -> Result<(&[u8], WikidataEntityJson)> {
@@ -431,33 +439,48 @@ fn write_segmented(
                     let ent = serde_json::from_slice(json_str)?;
                     Ok((json_str, ent))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let entities: Vec<(&[u8], WikidataEntity)> = entity_results.into_iter().try_fold(
                 Vec::with_capacity(LINES_PER_CHUNK),
-                |mut acc, res| -> Result<_> {
-                    let (json, ent_raw) = res?;
+                |mut acc, (json, ent_raw)| -> Result<_> {
                     let ent = ent_raw.try_into()?;
                     acc.push((json, ent));
                     Ok(acc)
                 },
             )?;
-            for (json_str, ent) in entities {
-                if let Some(title) = ent.enwiki_title {
+            for (_, ent) in entities.iter() {
+                if let Some(title) = &ent.enwiki_title {
                     writeln!(output_en, "{}\t{}", title, ent.id_str)?;
                     enwiki_count += 1;
                 }
-                let mut enc = Compressor::with_prepared_dictionary(&cdict)?;
-                let csize = enc.compress_to_buffer(json_str, &mut compressed_buf)?;
-                output_plain.write_all(&compressed_buf)?;
-                let csize_32 = csize
-                    .try_into()
-                    .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
-                ind_entries.push(WikidataLeaf::new(ent.id, compressed_offset, csize_32));
-                for prop_id in ent.claims.into_iter() {
+                for prop_id in ent.claims.iter().copied() {
                     prop_ind_entries.push((prop_id, ent.id));
                     prop_max_id = prop_max_id.max(prop_id);
                 }
-                compressed_offset += csize as u64;
+            }
+
+            let leaves = entities
+                .par_iter()
+                .map_with(output_plain.clone(), |s, (json_str, ent)| -> Result<WikidataLeaf> {
+                    let mut compressed_buf = buffers.try_pull().expect("could not check out buffer from pool");
+                    let mut enc = Compressor::with_prepared_dictionary(&cdict)?;
+                    let csize = enc.compress_to_buffer(json_str, compressed_buf.deref_mut())?;
+
+                    let mut guard = s.lock().unwrap();
+                    let (compressed_offset, fp) = guard.deref_mut();
+                    fp.write_all(&compressed_buf)?;
+
+                    let csize_32 = csize
+                        .try_into()
+                        .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
+                    let leaf = WikidataLeaf::new(ent.id, *compressed_offset, csize_32);
+                    *compressed_offset += csize as u64;
+                    Ok(leaf)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            for leaf in leaves {
+                ind_entries.push(leaf);
                 entity_number += 1;
                 if entity_number % 1000 == 0 {
                     eprint!(
@@ -623,7 +646,7 @@ pub fn write_index<W: Write + Seek>(
     }
 
     // STEP 2d: propagate keys and pointers up the tree, one level at a time
-    for level_id in (0 .. level_descriptions.len()-1).rev() {
+    for level_id in (0..level_descriptions.len() - 1).rev() {
         let ld = &level_descriptions[level_id];
         assert_eq!(level_keys.len(), ld.total_children() as usize);
         assert_eq!(level_keys.len(), level_pointers.len());
@@ -717,7 +740,11 @@ pub fn write_prop_index<W: Write + Seek>(
         }
     }
     if last_prop_id != prop_max_id {
-        return Err(ErrorKind::Msg(format!("want prop_max_id = {}, got {}", prop_max_id, last_prop_id)).into())
+        return Err(ErrorKind::Msg(format!(
+            "want prop_max_id = {}, got {}",
+            prop_max_id, last_prop_id
+        ))
+        .into());
     }
     metadata.push((prop_card, offset));
     offset += std::mem::size_of_val(&entity_ids[..]) as u64;
