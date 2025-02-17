@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -28,58 +29,84 @@ struct WikidataNode<'a> {
 impl<'a> WikidataNode<'a> {
     #[cfg(target_endian = "little")]
     fn keys(&self) -> impl Iterator<Item = u64> + 'a {
-        self.keys_native.iter().map(|x| x.swap_bytes())
+        self.keys_native.iter().copied()
     }
 
     #[cfg(target_endian = "big")]
-    fn keys(&self) -> impl Iterator<Item = u64> {
-        self.keys_native.iter().copied()
+    fn keys(&self) -> impl Iterator<Item = u64> + 'a {
+        self.keys_native.iter().map(|x| x.swap_bytes())
     }
 
     #[cfg(target_endian = "little")]
     fn pointer(&self, index: usize) -> u64 {
-        self.ptrs_native[index].swap_bytes()
+        self.ptrs_native[index]
     }
 
     #[cfg(target_endian = "big")]
     fn pointer(&self, index: usize) -> u64 {
-        self.ptrs_native[index];
+        self.ptrs_native[index].swap_bytes()
     }
 }
 
 #[repr(C)]
 #[repr(packed(4))]
-struct WikidataLeaf(u64, u64, u32);
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WikidataLeaf(u64, u64, u32);
 
 impl WikidataLeaf {
     #[cfg(target_endian = "little")]
+    pub(crate) fn new(key: u64, offset: u64, length: u32) -> Self {
+        Self(key, offset, length)
+    }
+
+    #[cfg(target_endian = "big")]
+    pub(crate) fn new(key: u64, offset: u64, length: u32) -> Self {
+        Self(key.swap_bytes(), offset.swap_bytes(), length.swap_bytes())
+    }
+
+    #[rustfmt::skip]
+    pub(crate) fn to_le_bytes(&self) -> [u8; 20] {
+        // to_ne_bytes is used because the in-memory fields
+        // are little-endian
+        let key_b = self.0.to_ne_bytes();
+        let off_b = self.1.to_ne_bytes();
+        let len_b = self.2.to_ne_bytes();
+
+        [
+            key_b[0], key_b[1], key_b[2], key_b[3], key_b[4], key_b[5], key_b[6], key_b[7],
+            off_b[0], off_b[1], off_b[2], off_b[3], off_b[4], off_b[5], off_b[6], off_b[7],
+            len_b[0], len_b[1], len_b[2], len_b[3],
+        ]
+    }
+
+    #[cfg(target_endian = "little")]
+    pub(crate) fn key(&self) -> u64 {
+        self.0
+    }
+
+    #[cfg(target_endian = "big")]
     fn key(&self) -> u64 {
         self.0.swap_bytes()
     }
 
-    #[cfg(target_endian = "big")]
-    fn key(&self) -> u64 {
-        self.0
+    #[cfg(target_endian = "little")]
+    pub(crate) fn data_offset(&self) -> u64 {
+        self.1
     }
 
-    #[cfg(target_endian = "little")]
+    #[cfg(target_endian = "big")]
     fn data_offset(&self) -> u64 {
         self.1.swap_bytes()
     }
 
-    #[cfg(target_endian = "big")]
-    fn data_offset(&self) -> u64 {
-        self.1
+    #[cfg(target_endian = "little")]
+    pub(crate) fn data_length(&self) -> u32 {
+        self.2
     }
 
-    #[cfg(target_endian = "little")]
+    #[cfg(target_endian = "big")]
     fn data_length(&self) -> u32 {
         self.2.swap_bytes()
-    }
-
-    #[cfg(target_endian = "big")]
-    fn data_length(&self) -> u32 {
-        self.2
     }
 }
 
@@ -100,7 +127,7 @@ impl<'a> WikidataIndex<'a> {
         }
         let (n_groups_b, rest) = raw.split_at(8);
         buf8.copy_from_slice(n_groups_b);
-        let n_groups64 = u64::from_be_bytes(buf8);
+        let n_groups64 = u64::from_le_bytes(buf8);
         let n_groups = n_groups64 as usize;
 
         if rest.len() < 8 * n_groups {
@@ -116,7 +143,7 @@ impl<'a> WikidataIndex<'a> {
         }
         let (n_levels_b, rest) = rest.split_at(8);
         buf8.copy_from_slice(n_levels_b);
-        let n_levels = u64::from_be_bytes(buf8);
+        let n_levels = u64::from_le_bytes(buf8);
 
         let mut leaf_level_b = rest;
         let mut base = 8 * (1 + n_groups + 1);
@@ -127,12 +154,12 @@ impl<'a> WikidataIndex<'a> {
                 return Err(ErrorKind::Msg("wikidata index: unexpected EOF".to_string()).into());
             }
             buf8.copy_from_slice(&leaf_level_b[..8]);
-            let node_size = u64::from_be_bytes(buf8) as usize;
+            let node_size = u64::from_le_bytes(buf8) as usize;
             if leaf_level_b.len() < 16 * node_size {
                 return Err(ErrorKind::Msg("wikidata index: unexpected EOF".to_string()).into());
             }
             buf8.copy_from_slice(&leaf_level_b[8 * node_size..8 * node_size + 8]);
-            let first_ptr = u64::from_be_bytes(buf8) as usize;
+            let first_ptr = u64::from_le_bytes(buf8) as usize;
             let first_ptr_dist = first_ptr.checked_sub(base).ok_or_else(|| {
                 ErrorKind::Msg(
                     "wikidata index: node pointer must not point to a previous level".to_string(),
@@ -181,12 +208,12 @@ impl<'a> WikidataIndex<'a> {
 
     #[cfg(target_endian = "little")]
     fn group_offsets(&self) -> impl Iterator<Item = u64> + 'a {
-        self.group_offsets_native.iter().map(|x| x.swap_bytes())
+        self.group_offsets_native.iter().copied()
     }
 
     #[cfg(target_endian = "big")]
     fn group_offsets(&self) -> impl Iterator<Item = u64> {
-        self.group_offsets_native.iter().copied()
+        self.group_offsets_native.iter().map(|x| x.swap_bytes())
     }
 
     const fn header_bytes(&self) -> u64 {
@@ -200,16 +227,55 @@ impl<'a> WikidataIndex<'a> {
         8 * self.node_levels_native.len() as u64
     }
 
-    fn get_many(&self, mut query_keys: Vec<u64>) -> Vec<(u64, u32)> {
+    /// When `is_start` is true, returns the leaf index of the first key >= the argument
+    /// When `is_start` is false, returns the leaf index of the last key <= the argument
+    fn get_bound(&self, key: u64, is_start: bool) -> Option<usize> {
+        let mut level = 0;
+        let mut pos = 0;
+        while level < self.n_levels - 1 {
+            let width = self.node_levels_native[pos] as usize;
+
+            #[cfg(target_endian = "big")]
+            let width = width.swap_bytes();
+
+            let node = WikidataNode {
+                keys_native: &self.node_levels_native[pos + 1..pos + width],
+                ptrs_native: &self.node_levels_native[pos + width..pos + 2 * width],
+            };
+            let child_idx = node.keys().position(|k| key < k).unwrap_or(width - 1);
+            let p = node.pointer(child_idx);
+            pos = if level < self.n_levels - 2 {
+                // calculate index into node_levels_native
+                ((p - self.header_bytes()) / 8) as usize
+            } else {
+                ((p - self.header_bytes() - self.node_levels_bytes()) / 20) as usize
+            };
+            level += 1;
+        }
+
+        let end = (pos + TREE_FANOUT as usize).min(self.leaf_level_native.len());
+        let leaves = &self.leaf_level_native[pos..end];
+        let found_idx = if is_start {
+            leaves.iter().position(|leaf| leaf.key() >= key)
+        } else {
+            leaves.iter().rposition(|leaf| leaf.key() <= key)
+        };
+        found_idx.map(|i| i + pos)
+    }
+
+    fn slice_leaves(&self, start: usize, end: usize) -> impl Iterator<Item = (u64, u32)> + 'a {
+        self.leaf_level_native[start..end].iter().map(|leaf| (leaf.data_offset(), leaf.data_length()))
+    }
+
+    fn get_many(&self, query_keys: &[u64]) -> Vec<(u64, u32)> {
         let mut result = Vec::with_capacity(query_keys.len());
         let mut search_queue = VecDeque::new();
-        query_keys.sort();
         search_queue.push_back((0, 0, &query_keys[..]));
         while let Some((level, pos, mut candidates)) = search_queue.pop_front() {
             if level < self.n_levels - 1 {
                 let width = self.node_levels_native[pos] as usize;
 
-                #[cfg(target_endian = "little")]
+                #[cfg(target_endian = "big")]
                 let width = width.swap_bytes();
 
                 let node = WikidataNode {
@@ -222,6 +288,10 @@ impl<'a> WikidataIndex<'a> {
                         .position(|cand| cand >= &k)
                         .unwrap_or_else(|| candidates.len());
                     if cut > 0 {
+                        // Pop `matches` from the front of candidates; `matches` are the candidates
+                        // which are less than the i-th node key. Since they weren't popped in a previous iteration,
+                        // all must be in the half-open range from keys[i-1] to keys[i], which is
+                        // the domain of ptr[i].
                         let matched = &candidates[..cut];
                         candidates = &candidates[cut..];
                         let p = node.pointer(i);
@@ -235,6 +305,8 @@ impl<'a> WikidataIndex<'a> {
                     }
                 }
                 if candidates.len() > 0 {
+                    // Anything still in candidates is in the half-open range from keys[width-2] to infinity,
+                    // which is the domain ot ptrs[width-1].
                     let p = node.pointer(width - 1);
                     let pos = if level < self.n_levels - 2 {
                         // calculate index into node_levels_native
@@ -301,7 +373,7 @@ fn read_dicts_file(
     let mut group_offsets = index.group_offsets();
     while rest.len() >= 4 {
         len_buf.copy_from_slice(&rest[..4]);
-        let length = u32::from_be_bytes(len_buf) as usize;
+        let length = u32::from_le_bytes(len_buf) as usize;
         if rest.len() < 4 + length {
             return Err(ErrorKind::Msg("wikidata dicts: unexpected EOF".to_string()).into());
         }
@@ -328,10 +400,13 @@ fn read_en_index_file(path: &str) -> Result<HashMap<String, u64>> {
     let mut result = HashMap::new();
     for line_res in en_index_file.lines() {
         let mut line = line_res?;
-        let cut = line.find('\t').ok_or_else(|| ErrorKind::EntityError("invalid line in en.index.txt"))?;
-        let value_s = line.split_off(cut+1);
-        line.pop().unwrap();  // remove the '\t'
-        let value = parse_entity_id(&value_s).ok_or_else(|| ErrorKind::EntityError("invalid entity ID in en.index.txt"))?;
+        let cut = line
+            .find('\t')
+            .ok_or_else(|| ErrorKind::EntityError("invalid line in en.index.txt"))?;
+        let value_s = line.split_off(cut + 1);
+        line.pop().unwrap(); // remove the '\t'
+        let value = parse_entity_id(&value_s)
+            .ok_or_else(|| ErrorKind::EntityError("invalid entity ID in en.index.txt"))?;
         let _ = result.insert(line, value);
     }
     Ok(result)
@@ -340,7 +415,26 @@ fn read_en_index_file(path: &str) -> Result<HashMap<String, u64>> {
 #[derive(Deserialize)]
 enum QueryType {
     Id,
+    IdRange,
     Title,
+}
+
+#[derive(Debug, Clone)]
+enum QueryArgsInternal {
+    Vec(Vec<u64>),
+    Range(Range<u64>),
+}
+
+impl From<Vec<u64>> for QueryArgsInternal {
+    fn from(value: Vec<u64>) -> Self {
+        Self::Vec(value)
+    }
+}
+
+impl From<Range<u64>> for QueryArgsInternal {
+    fn from(value: Range<u64>) -> Self {
+        Self::Range(value)
+    }
 }
 
 #[derive(Deserialize)]
@@ -412,23 +506,44 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                             continue;
                         }
                     };
-                    let query_keys: Option<Vec<u64>> = match query.type_ {
+                    if matches!(query.type_, QueryType::IdRange) {
+                        if query.args.len() != 2 {}
+                    }
+                    let query_args: Option<QueryArgsInternal> = match query.type_ {
                         QueryType::Id => query
                             .args
                             .into_iter()
                             .map(|id| parse_entity_id(&id))
-                            .collect(),
+                            .collect::<Option<Vec<_>>>()
+                            .map(|e| e.into()),
+                        QueryType::IdRange => match query.args.as_slice() {
+                            [start_s, end_s] => {
+                                let start_opt = parse_entity_id(start_s);
+                                let end_opt = parse_entity_id(end_s);
+                                start_opt.and_then(|start| {
+                                    end_opt.filter(|end| *end >= start).map(|end| Range { start, end }.into())
+                                })
+                            }
+                            _ => {
+                                sender
+                                    .send_text("{\"error\": \"could not parse query\"}")
+                                    .await?;
+                                sender.flush().await?;
+                                continue;
+                            }
+                        },
                         QueryType::Title => Some(
                             query
                                 .args
                                 .into_iter()
                                 .filter_map(|title| en_index.get(&title))
                                 .copied()
-                                .collect(),
+                                .collect::<Vec<_>>()
+                                .into(),
                         ),
                     };
-                    let query_keys = match query_keys {
-                        Some(lst) => lst,
+                    let query_args = match query_args {
+                        Some(a) => a,
                         None => {
                             eprintln!("malformed IDs in args");
                             sender
@@ -438,8 +553,24 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                             continue;
                         }
                     };
-                    let query_size = query_keys.len();
-                    let mut data_ranges = wd_index.get_many(query_keys);
+                    let (query_size, mut data_ranges) = match query_args {
+                        QueryArgsInternal::Vec(mut lst) => {
+                            lst.sort();
+                            let drs = wd_index.get_many(&lst);
+                            (lst.len(), drs)
+                        }
+                        QueryArgsInternal::Range(Range { start, end }) => {
+                            if let Some(start_leaf) = wd_index.get_bound(start, true) {
+                                if let Some(end_leaf) = wd_index.get_bound(end, false) {
+                                    (0, wd_index.slice_leaves(start_leaf, end_leaf).collect())
+                                } else {
+                                    (0, vec![])
+                                }
+                            } else {
+                                (0, vec![])
+                            }
+                        }
+                    };
                     data_ranges.sort();
                     if data_ranges.is_empty() {
                         sender.send_text("").await?;

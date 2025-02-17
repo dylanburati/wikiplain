@@ -8,6 +8,7 @@ mod querier;
 
 error_chain! {
     foreign_links {
+        DeserError(serde_json::Error);
         FromUtf8Error(std::string::FromUtf8Error);
         Utf8Error(std::str::Utf8Error);
         IoError(std::io::Error);
@@ -29,7 +30,7 @@ error_chain! {
 
 fn cli() -> Command {
     Command::new("wikidata_indexer2")
-        .about("Deal with Wikidata .ldjson.gz files")
+        .about("Deal with Wikidata JSON entity dumps")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
@@ -42,7 +43,7 @@ fn cli() -> Command {
         .subcommand(
             Command::new("query")
                 .about("Starts a server for querying a processed Wikidata dump")
-                .arg(arg!(<path> "Path to the main processed .ldjson.gz file").required(true))
+                .arg(arg!(<path> "Path to the main processed .zst file").required(true))
                 .arg(
                     arg!(-p <port> "TCP port number for the server")
                         .value_parser(value_parser!(u16))

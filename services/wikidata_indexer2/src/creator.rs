@@ -1,25 +1,89 @@
-use std::borrow::Borrow;
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::{Deref, DerefMut};
+use std::result::Result as StdResult;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use flate2::read::MultiGzDecoder;
-use nom::error::VerboseError;
-use nom::AsBytes;
+use itertools::Itertools;
+use memmap2::Mmap;
+use object_pool::Pool;
 use rand::Rng;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
+use serde::Deserialize;
+use simd_json::prelude::ArrayTrait;
 use zstd::bulk::Compressor;
 use zstd::dict::EncoderDictionary;
 
-use crate::creator::item_parser::JsonValue;
-use crate::{ErrorKind, Result};
+use crate::querier::WikidataLeaf;
+use crate::{Error, ErrorKind, Result};
 
-use self::item_parser::{JsonPathItem, Selector};
+#[derive(Deserialize)]
+struct HasTitle {
+    title: String,
+}
 
-mod item_parser;
+#[derive(Deserialize)]
+struct WikidataClaimValue {}
 
-pub const TREE_FANOUT: u32 = 256;
-const TREE_FANOUT_LONG: u64 = TREE_FANOUT as u64;
+#[derive(Deserialize)]
+struct WikidataSitelinks {
+    enwiki: Option<HasTitle>,
+}
+
+#[derive(Deserialize)]
+struct WikidataEntityJson {
+    id: String,
+    sitelinks: Option<WikidataSitelinks>,
+    claims: FxHashMap<String, Vec<WikidataClaimValue>>,
+}
+
+struct WikidataEntity {
+    id: u64,
+    id_str: String,
+    enwiki_title: Option<String>,
+    claims: Vec<u64>,
+}
+
+const ENTITY_KIND_SHIFT: u64 = 56;
+const ENTITY_NUM_MASK: u64 = (1 << 56) - 1;
+
+impl TryFrom<WikidataEntityJson> for WikidataEntity {
+    type Error = Error;
+
+    fn try_from(value: WikidataEntityJson) -> StdResult<Self, Self::Error> {
+        let WikidataEntityJson {
+            id: id_str,
+            sitelinks,
+            claims: claims_raw,
+        } = value;
+        let (id_kind, id_num_str) = id_str.split_at(1);
+        let id_num: u64 = id_num_str.parse()?;
+        let id = id_num | ((id_kind.as_bytes()[0] as u64) << ENTITY_KIND_SHIFT);
+        let enwiki_title = sitelinks.and_then(|obj| obj.enwiki).map(|obj| obj.title);
+        let claims = claims_raw
+            .into_keys()
+            .map(|id_str| {
+                let (id_kind, id_num_str) = id_str.split_at(1);
+                let id_num: u64 = id_num_str.parse()?;
+                Ok(id_num | ((id_kind.as_bytes()[0] as u64) << ENTITY_KIND_SHIFT))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(WikidataEntity {
+            id,
+            id_str,
+            enwiki_title,
+            claims,
+        })
+    }
+}
+
+pub const TREE_FANOUT: u64 = 256;
 pub const CDICT_SIZE: usize = 128 * 1024;
 pub const ENTITIES_PER_CDICT: usize = 100000;
 
@@ -51,9 +115,7 @@ impl LevelDesc {
     }
 
     fn total_children(&self) -> u64 {
-        self.width.saturating_sub(2) * TREE_FANOUT_LONG
-            + self.children1 as u64
-            + self.children2 as u64
+        self.width.saturating_sub(2) * TREE_FANOUT + self.children1 as u64 + self.children2 as u64
     }
 
     fn node_sizes(&self) -> impl Iterator<Item = u32> {
@@ -69,7 +131,7 @@ impl LevelDesc {
             } else if remaining == 2 {
                 Some(children2)
             } else {
-                Some(TREE_FANOUT)
+                Some(TREE_FANOUT as u32)
             };
             remaining -= 1;
             res
@@ -77,17 +139,21 @@ impl LevelDesc {
     }
 
     fn from_total_children(total: u64) -> LevelDesc {
-        let full_nodes = total / TREE_FANOUT_LONG;
+        let full_nodes = total / TREE_FANOUT;
         if full_nodes == 0 {
             return Self::new(1, u32::try_from(total).unwrap(), 0);
         }
-        let remainder = u32::try_from(total % TREE_FANOUT_LONG).unwrap();
+        let remainder = (total % TREE_FANOUT) as u32;
         if remainder == 0 {
-            let children2 = if full_nodes == 1 { 0 } else { TREE_FANOUT };
-            return Self::new(full_nodes, TREE_FANOUT, children2);
+            let children2 = if full_nodes == 1 {
+                0
+            } else {
+                TREE_FANOUT as u32
+            };
+            return Self::new(full_nodes, TREE_FANOUT as u32, children2);
         }
-        let children1 = (TREE_FANOUT + remainder) / 2;
-        let children2 = TREE_FANOUT + remainder - children1;
+        let children1 = (TREE_FANOUT as u32 + remainder) / 2;
+        let children2 = TREE_FANOUT as u32 + remainder - children1;
         Self::new(full_nodes + 1, children1, children2)
     }
 
@@ -98,7 +164,7 @@ impl LevelDesc {
         //  0,  8,                        8*ct,                        16*ct
         let mut result = 0;
         if self.width > 2 {
-            result += (self.width - 2) * 16 * TREE_FANOUT_LONG;
+            result += (self.width - 2) * 16 * TREE_FANOUT;
         }
         if self.width > 1 {
             result += 16 * (self.children2 as u64);
@@ -114,90 +180,39 @@ impl LevelDesc {
     //         None | Some(0) => None,
     //         Some(1) => {
     //             // last node pos == size of (`width-2` nodes + 2nd to last node)
-    //             let full_nodes_width = self.width.saturating_sub(2) * 16 * TREE_FANOUT_LONG;
-    //             let nonfull_node_width = (self.children2 as u64) * 16 * TREE_FANOUT_LONG;
+    //             let full_nodes_width = self.width.saturating_sub(2) * 16 * TREE_FANOUT;
+    //             let nonfull_node_width = (self.children2 as u64) * 16 * TREE_FANOUT;
     //             Some(full_nodes_width + nonfull_node_width)
     //         }
     //         _ => {
     //             // nodes before 2nd to last are all full
-    //             let full_nodes_width = (node_index as u64) * 16 * TREE_FANOUT_LONG;
+    //             let full_nodes_width = (node_index as u64) * 16 * TREE_FANOUT;
     //             Some(full_nodes_width)
     //         }
     //     }
     // }
 
     fn is_child_first_in_node(&self, child_index: u64) -> bool {
-        let full_nodes_width = self.width.saturating_sub(2) * TREE_FANOUT_LONG;
+        let full_nodes_width = self.width.saturating_sub(2) * TREE_FANOUT;
         if child_index <= full_nodes_width {
-            return child_index % TREE_FANOUT_LONG == 0;
+            return child_index % TREE_FANOUT == 0;
         }
         child_index == full_nodes_width + self.children2 as u64
     }
 }
 
-struct DiskIter<R: Read> {
-    inner: BufReader<R>,
-}
-
-impl<R: Read> DiskIter<R> {
-    fn new(inner: R) -> DiskIter<R> {
-        Self {
-            inner: BufReader::new(inner),
-        }
-    }
-}
-
-impl<R: Read> Iterator for DiskIter<R> {
-    type Item = std::io::Result<(u64, u64, u32)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut buf = [0u8; 8];
-        let a = match self.inner.read_exact(&mut buf) {
-            Ok(_) => u64::from_be_bytes(buf),
-            Err(err) => {
-                return match err.kind() {
-                    std::io::ErrorKind::UnexpectedEof => None,
-                    _ => Some(Err(err)),
-                };
-            }
-        };
-
-        let b = match self.inner.read_exact(&mut buf) {
-            Ok(_) => u64::from_be_bytes(buf),
-            Err(err) => return Some(Err(err)),
-        };
-
-        let mut buf = [0u8; 4];
-        let c = match self.inner.read_exact(&mut buf) {
-            Ok(_) => u32::from_be_bytes(buf),
-            Err(err) => return Some(Err(err)),
-        };
-
-        Some(Ok((a, b, c)))
-    }
-}
-
-#[derive(PartialEq, Eq)]
-struct DatumWrapper((u64, u64, u32), usize);
-
-impl PartialOrd for DatumWrapper {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        other.0.partial_cmp(&self.0)
-    }
-}
-
-impl Ord for DatumWrapper {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.0.cmp(&self.0)
-    }
-}
-
 struct Segmented {
     group_offsets: Vec<u64>,
-    staged_count: u64,
-    ind_entries: Vec<(u64, u64, u32)>,
-    prop_staged_count: u64,
+    /// file_stg contains a multiple of STG_BLOCK_LIMIT WikidataLeaf records
+    file_stg: File,
+    /// ind_entries contains the unsorted WikidataLeaf records which are not in file_stg
+    ind_entries: Vec<WikidataLeaf>,
+
+    /// file_stg_secondary contains a multiple of STG_BLOCK_LIMIT (property id, entity id) pairs
+    file_stg_secondary: File,
+    /// prop_ind_entries contains the unsorted (property id, entity id) pairs which are not in file_stg
     prop_ind_entries: Vec<(u64, u64)>,
+    prop_max_id: u64,
 }
 
 // a couple thousand less than 2^24, so the vector doesn't reserve past that capacity
@@ -207,7 +222,8 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
     let base = output_path.strip_suffix(".zst").unwrap_or(output_path);
     let output_dicts_path = base.to_string() + ".zdicts";
     let output_index_path = base.to_string() + ".index.bin";
-    let output_index_en_path = base.to_string() + "-en.index.txt";
+    let output_en_index_path = base.to_string() + "-en.index.txt";
+    let output_prop_index_path = base.to_string() + "-prop.index.bin";
     let working_path_secondary = working_path.to_string() + "2";
 
     let file_input = OpenOptions::new().read(true).open(input_path)?;
@@ -226,7 +242,7 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
         .create(true)
         .write(true)
         .truncate(true)
-        .open(output_index_en_path)?;
+        .open(output_en_index_path)?;
     let file_stg = OpenOptions::new()
         .create(true)
         .read(true)
@@ -238,54 +254,82 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
         .read(true)
         .write(true)
         .truncate(true)
-        .open(working_path_secondary)?;
+        .open(&working_path_secondary)?;
 
-    let (dict_consumer, dict_supplier) = sync_channel::<Result<Vec<u8>>>(4);
+    let (dict_sender, dict_receiver) = sync_channel::<Vec<u8>>(4);
     std::thread::scope(|s| -> Result<()> {
-        s.spawn(
-            || match get_zstd_dicts(file_input2, dict_consumer.clone()) {
-                Ok(_) => {}
-                Err(e) => dict_consumer.send(Err(e)).unwrap(),
-            },
+        let dict_producer_thread = s.spawn(
+            || get_zstd_dicts(file_input2, dict_sender.clone())
         );
 
-        let segmented = write_segmented(
-            file_input,
-            file_output,
-            file_dicts,
-            file_en,
-            file_stg,
-            file_stg_secondary,
-            dict_supplier,
-        )?;
-        let file_ind = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(output_index_path)?;
-        let mut staged_entry_files = vec![];
-        let mut stg_offset = 0;
-        while stg_offset < 16 * segmented.staged_count {
-            let mut reader = OpenOptions::new().read(true).open(working_path)?;
-            let _ = reader.seek(SeekFrom::Start(stg_offset))?;
-            staged_entry_files.push(reader.take(16 * STG_BLOCK_LIMIT as u64));
-            stg_offset += 16 * STG_BLOCK_LIMIT as u64;
-        }
-        let _ = write_index(
-            segmented.ind_entries,
-            segmented.group_offsets,
-            staged_entry_files,
-            segmented.staged_count,
-            file_ind,
-        )?;
-        Ok(())
+        let writer_thread = s.spawn(|| -> Result<()> {
+            let mut segmented = write_segmented(
+                file_input,
+                file_output,
+                file_dicts,
+                file_en,
+                file_stg,
+                file_stg_secondary,
+                dict_receiver,
+            )?;
+            segmented.ind_entries.sort();
+            let mut stg_entries = vec![segmented.ind_entries.as_slice()];
+            let stg_bytes = unsafe { Mmap::map(&segmented.file_stg) }?;
+            let mut stg_offset = 0;
+            let stride = std::mem::size_of::<WikidataLeaf>();
+            while stg_offset < stg_bytes.len() {
+                let entry_chunk: &[WikidataLeaf] = unsafe {
+                    std::slice::from_raw_parts(
+                        std::mem::transmute(stg_bytes.as_ptr().add(stg_offset)),
+                        STG_BLOCK_LIMIT,
+                    )
+                };
+                stg_entries.push(entry_chunk);
+                stg_offset += stride * STG_BLOCK_LIMIT;
+            }
+            let file_ind = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(output_index_path)?;
+            let _ = write_index(stg_entries, segmented.group_offsets, file_ind)?;
+            drop(stg_bytes);
+
+            segmented.prop_ind_entries.sort();
+            let mut stg_secondary_entries = vec![segmented.prop_ind_entries.as_slice()];
+            let stg_secondary_bytes = unsafe { Mmap::map(&segmented.file_stg_secondary) }?;
+            let mut stg_secondary_offset = 0;
+            let stride = std::mem::size_of::<(u64, u64)>();
+            while (stg_secondary_offset + stride * STG_BLOCK_LIMIT) <= stg_secondary_bytes.len() {
+                let entry_chunk: &[(u64, u64)] = unsafe {
+                    std::slice::from_raw_parts(
+                        std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
+                        STG_BLOCK_LIMIT,
+                    )
+                };
+                stg_secondary_entries.push(entry_chunk);
+                stg_secondary_offset += stride * STG_BLOCK_LIMIT;
+            }
+            let file_prop_ind = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(output_prop_index_path)?;
+            let _ = write_prop_index(stg_secondary_entries, segmented.prop_max_id, file_prop_ind)?;
+            drop(stg_secondary_bytes);
+            Ok(())
+        });
+
+        writer_thread.join().unwrap()?;
+        dict_producer_thread.join().unwrap()
     })?;
     std::fs::remove_file(working_path)?;
+    std::fs::remove_file(working_path_secondary)?;
     Ok(())
 }
 
 /// STEP 0: train the compressor and create a dictionary which will be shared for all items
-fn get_zstd_dicts(file_input: File, dict_consumer: SyncSender<Result<Vec<u8>>>) -> Result<()> {
+fn get_zstd_dicts(file_input: File, dict_sender: SyncSender<Vec<u8>>) -> Result<()> {
     let mut input = MultiGzDecoder::new(file_input);
     // Skip "[\n", then buffer starting from the first object / second line
     let mut array_start_buf = [0u8; 2];
@@ -324,7 +368,7 @@ fn get_zstd_dicts(file_input: File, dict_consumer: SyncSender<Result<Vec<u8>>>) 
         }
 
         let cdict_bytes = zstd::dict::from_samples(&reservoir, CDICT_SIZE)?;
-        dict_consumer.send(Ok(cdict_bytes)).unwrap();
+        dict_sender.send(cdict_bytes).map_err(|_| Error::from(ErrorKind::Msg(format!("send failed"))))?;
     }
     Ok(())
 }
@@ -340,10 +384,10 @@ fn write_segmented(
     file_en: File,
     file_stg: File,
     file_stg_secondary: File,
-    dict_supplier: Receiver<Result<Vec<u8>>>,
+    dict_receiver: Receiver<Vec<u8>>,
 ) -> Result<Segmented> {
     let mut input = MultiGzDecoder::new(file_input);
-    let mut output_plain = BufWriter::with_capacity(131072, file_output);
+    let output_plain = Arc::new(Mutex::new((0u64, BufWriter::with_capacity(131072, file_output))));
     let mut output_dicts = BufWriter::with_capacity(131072, file_output_dicts);
     let mut output_en = BufWriter::with_capacity(131072, file_en);
     let mut file_stg = Some(file_stg);
@@ -352,166 +396,123 @@ fn write_segmented(
     // Skip "[\n", then buffer starting from the first object / second line
     let mut array_start_buf = [0u8; 2];
     input.read_exact(&mut array_start_buf)?;
-    let mut input = BufReader::new(input);
+    let input = BufReader::new(input);
 
-    let mut line = Vec::new();
     let mut eof = false;
     let mut enwiki_count = 0;
-    let mut ind_entries: Vec<(u64, u64, u32)> = vec![];
+    let mut ind_entries: Vec<WikidataLeaf> = vec![];
     let mut prop_ind_entries: Vec<(u64, u64)> = vec![];
     let mut staged_count: u64 = 0;
     let mut prop_staged_count: u64 = 0;
+    let mut prop_max_id: u64 = 0;
     let mut entity_number: u64 = 0;
-    let mut compressed_offset: u64 = 0;
     let mut group_offsets = vec![];
-    let mut compressed_buf = Vec::with_capacity(1024 * 1024);
-    let selectors = [
-        Selector::new(vec![JsonPathItem::Key("id")]),
-        Selector::new(vec![
-            JsonPathItem::Key("sitelinks"),
-            JsonPathItem::Key("enwiki"),
-            JsonPathItem::Key("title"),
-        ]),
-        Selector::new(vec![JsonPathItem::Key("claims")]),
-    ];
 
+    const LINES_PER_CHUNK: usize = 200;
+    assert_eq!(ENTITIES_PER_CDICT % LINES_PER_CHUNK, 0);
+    let buffers = Pool::new(LINES_PER_CHUNK, || Vec::with_capacity(1024 * 1024));
+
+    let lines_lazy_iterable = input.split(b'\n').chunks(LINES_PER_CHUNK);
+    let mut lines_lazy_iter = lines_lazy_iterable.into_iter();
     while !eof {
         let next_group_start = entity_number + ENTITIES_PER_CDICT as u64;
-        let cdict_bytes = dict_supplier.recv().unwrap()?;
+        let cdict_bytes = dict_receiver.recv().unwrap();
         let cdict_size = cdict_bytes.len() as u32;
-        output_dicts.write_all(&cdict_size.to_be_bytes())?;
+        output_dicts.write_all(&cdict_size.to_le_bytes())?;
         output_dicts.write_all(&cdict_bytes)?;
-        let cdict = EncoderDictionary::copy(&cdict_bytes, 3);
-        group_offsets.push(compressed_offset);
+        let cdict = EncoderDictionary::copy(&cdict_bytes, 4);
+        let guard = output_plain.lock().unwrap();
+        let (compressed_offset, _) = guard.deref();
+        group_offsets.push(*compressed_offset);
+        drop(guard);
 
         while entity_number < next_group_start {
-            line.clear();
-            compressed_buf.clear();
-            let got = input.read_until(b'\n', &mut line)?;
-            if got == 0 {
+            let Some(lines_lazy) = lines_lazy_iter.next() else {
                 eof = true;
                 break;
-            }
-            let Some(json_str) = line.strip_suffix(b",\n") else {
-                continue;
             };
-            let (_, ent) = item_parser::parse_json::<VerboseError<&[u8]>>(json_str, &selectors)
-                .map_err(|err| {
-                    eprintln!(
-                        "{:?}",
-                        err.map(|inner| inner
-                            .errors
-                            .into_iter()
-                            .map(|(i, k)| (
-                                std::str::from_utf8(i).unwrap_or_else(|_| "<non-utf8>"),
-                                k
-                            ))
-                            .collect::<Vec<_>>())
+            let lines = lines_lazy.collect::<StdResult<Vec<_>, _>>()?;
+            let entity_results = lines
+                .par_iter()
+                .filter(|line| line.starts_with(b"{"))
+                .map(|line| -> Result<(&[u8], WikidataEntityJson)> {
+                    let json_str = line.strip_suffix(b",").unwrap_or(&line[..]);
+                    let ent = serde_json::from_slice(json_str)?;
+                    Ok((json_str, ent))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let entities: Vec<(&[u8], WikidataEntity)> = entity_results.into_iter().try_fold(
+                Vec::with_capacity(LINES_PER_CHUNK),
+                |mut acc, (json, ent_raw)| -> Result<_> {
+                    let ent = ent_raw.try_into()?;
+                    acc.push((json, ent));
+                    Ok(acc)
+                },
+            )?;
+            for (_, ent) in entities.iter() {
+                if let Some(title) = &ent.enwiki_title {
+                    writeln!(output_en, "{}\t{}", title, ent.id_str)?;
+                    enwiki_count += 1;
+                }
+                for prop_id in ent.claims.iter().copied() {
+                    prop_ind_entries.push((prop_id, ent.id));
+                    prop_max_id = prop_max_id.max(prop_id);
+                }
+            }
+
+            let leaves = entities
+                .par_iter()
+                .map_with(output_plain.clone(), |s, (json_str, ent)| -> Result<WikidataLeaf> {
+                    let mut compressed_buf = buffers.try_pull().expect("could not check out buffer from pool");
+                    let mut enc = Compressor::with_prepared_dictionary(&cdict)?;
+                    let csize = enc.compress_to_buffer(json_str, compressed_buf.deref_mut())?;
+
+                    let mut guard = s.lock().unwrap();
+                    let (compressed_offset, fp) = guard.deref_mut();
+                    fp.write_all(&compressed_buf)?;
+
+                    let csize_32 = csize
+                        .try_into()
+                        .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
+                    let leaf = WikidataLeaf::new(ent.id, *compressed_offset, csize_32);
+                    *compressed_offset += csize as u64;
+                    Ok(leaf)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            for leaf in leaves {
+                ind_entries.push(leaf);
+                entity_number += 1;
+                if entity_number % 1000 == 0 {
+                    eprint!(
+                        "\r\x1b[K{:>12}\t{:>12}\t{:>8}",
+                        prop_staged_count + prop_ind_entries.len() as u64,
+                        staged_count + ind_entries.len() as u64,
+                        enwiki_count
                     );
-                    ErrorKind::ParseJsonError
-                })?;
-            let entity_kvs = match ent {
-                JsonValue::Object(kvs) => kvs,
-                _ => {
-                    return Err(ErrorKind::EntityError("not an object").into());
                 }
-            };
-            let mut id_str = None;
-            let mut claims = None;
-            let mut title = None;
-            for (k, v) in entity_kvs {
-                match k.borrow() {
-                    "id" => match v {
-                        JsonValue::Str(s) => id_str = Some(s),
-                        _ => {
-                            return Err(ErrorKind::EntityError("id not a string").into());
-                        }
-                    },
-                    "claims" => match v {
-                        JsonValue::Object(claim_kvs) => claims = Some(claim_kvs),
-                        _ => {
-                            return Err(ErrorKind::EntityError("id not a string").into());
-                        }
-                    },
-                    "sitelinks" => match v {
-                        JsonValue::Object(sitelinks_kvs) => {
-                            if let Some((_, JsonValue::Object(link_kvs))) =
-                                sitelinks_kvs.into_iter().find(|(k, _)| k == "enwiki")
-                            {
-                                if let Some((_, JsonValue::Str(t))) =
-                                    link_kvs.into_iter().find(|(k, _)| k == "title")
-                                {
-                                    title = Some(t);
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
-            let id_str = id_str.ok_or_else(|| ErrorKind::EntityError("missing id"))?;
-            if let Some(title) = title {
-                writeln!(output_en, "{}\t{}", title, id_str)?;
-                enwiki_count += 1;
-            }
-            let (id_kind, id_num_str) = id_str.split_at(1);
-            let id_num: u64 = id_num_str.parse()?;
-            let id = id_num | ((id_kind.as_bytes()[0] as u64) << 56);
-            let mut enc = Compressor::with_prepared_dictionary(&cdict)?;
-            let csize = enc.compress_to_buffer(json_str.as_bytes(), &mut compressed_buf)?;
-            output_plain.write_all(&compressed_buf)?;
-            let csize_32 = csize
-                .try_into()
-                .map_err(|_| ErrorKind::EntityError("compressed size > 4GiB"))?;
-            ind_entries.push((id, compressed_offset, csize_32));
-            for (prop_id_str, _) in claims.into_iter().flatten() {
-                let (prop_kind, prop_num_str) = prop_id_str.split_at(1);
-                let prop_num: u64 = prop_num_str.parse()?;
-                let prop_id = prop_num | ((prop_kind.as_bytes()[0] as u64) << 56);
-                prop_ind_entries.push((prop_id, id));
-            }
-            compressed_offset += csize as u64;
-            entity_number += 1;
-            if entity_number % 1000 == 0 {
-                eprint!(
-                    "\r\x1b[K{:>12}\t{:>12}\t{:>8}",
-                    prop_staged_count + prop_ind_entries.len() as u64,
-                    staged_count + ind_entries.len() as u64,
-                    enwiki_count
-                );
             }
         }
         if !eof && ind_entries.len() >= STG_BLOCK_LIMIT {
             let block = &mut ind_entries[0..STG_BLOCK_LIMIT];
-            block.sort_by_key(|e| e.0);
+            block.sort();
 
             let mut output_stg = BufWriter::with_capacity(131072, file_stg.take().unwrap());
-            for (k, offset, length) in ind_entries.drain(0..STG_BLOCK_LIMIT) {
-                output_stg.write_all(&k.to_be_bytes())?;
-                output_stg.write_all(&offset.to_be_bytes())?;
-                output_stg.write_all(&length.to_be_bytes())?;
+            for item in ind_entries.drain(0..STG_BLOCK_LIMIT) {
+                output_stg.write_all(&item.to_le_bytes())?;
             }
             staged_count += STG_BLOCK_LIMIT as u64;
             let _ = file_stg.insert(output_stg.into_inner().map_err(std::io::Error::from)?);
         }
-        let prop_write = if eof {
-            // TODO: remove when create_index_secondary is implemented
-            prop_ind_entries.len()
-        } else if prop_ind_entries.len() >= STG_BLOCK_LIMIT {
-            STG_BLOCK_LIMIT
-        } else {
-            0
-        };
-        if prop_write > 0 {
-            let block = &mut prop_ind_entries[0..prop_write];
+        if !eof && prop_ind_entries.len() >= STG_BLOCK_LIMIT {
+            let block = &mut prop_ind_entries[0..STG_BLOCK_LIMIT];
             block.sort();
 
             let mut output_stg_secondary =
                 BufWriter::with_capacity(131072, file_stg_secondary.take().unwrap());
-            for (k, eidx) in prop_ind_entries.drain(0..prop_write) {
-                output_stg_secondary.write_all(&k.to_be_bytes())?;
-                output_stg_secondary.write_all(&eidx.to_be_bytes())?;
+            for (k, eid) in prop_ind_entries.drain(0..STG_BLOCK_LIMIT) {
+                output_stg_secondary.write_all(&k.to_le_bytes())?;
+                output_stg_secondary.write_all(&eid.to_le_bytes())?;
             }
             prop_staged_count += STG_BLOCK_LIMIT as u64;
             let _ = file_stg_secondary.insert(
@@ -525,10 +526,11 @@ fn write_segmented(
 
     Ok(Segmented {
         group_offsets,
-        staged_count,
+        file_stg: file_stg.unwrap(),
         ind_entries,
-        prop_staged_count,
+        file_stg_secondary: file_stg_secondary.unwrap(),
         prop_ind_entries,
+        prop_max_id,
     })
 }
 
@@ -557,17 +559,15 @@ fn write_segmented(
 ///
 /// at level N, the leaf block reached contains all valid keys in the interval indicated
 /// by its referencing pointer in level N-1
-pub fn write_index<R: Read, W: Write + Seek>(
-    mut entries: Vec<(u64, u64, u32)>,
+pub fn write_index<W: Write + Seek>(
+    entries: Vec<&[WikidataLeaf]>,
     group_offsets: Vec<u64>,
-    staged_entry_files: Vec<R>,
-    staged_count: u64,
     file: W,
 ) -> Result<W> {
     // STEP 2a: determine structure of tree (i.e. size of each level)
     let mut output = BufWriter::with_capacity(131072, file);
 
-    let num_leaves = staged_count + entries.len() as u64;
+    let num_leaves = entries.iter().map(|chunk| chunk.len() as u64).sum();
     let build_level_descriptions =
         std::iter::successors(Some(LevelDesc::from_total_children(num_leaves)), |prev| {
             if prev.width > 1 {
@@ -583,14 +583,14 @@ pub fn write_index<R: Read, W: Write + Seek>(
     //          the last.
     let mut offset: u64 = 0;
     let n_groups = group_offsets.len();
-    output.write_all(&u64::to_be_bytes(n_groups as u64))?;
+    output.write_all(&u64::to_le_bytes(n_groups as u64))?;
     offset += 8;
     for v in group_offsets.iter() {
-        output.write_all(&v.to_be_bytes())?;
+        output.write_all(&v.to_le_bytes())?;
         offset += 8;
     }
     let n_levels = level_descriptions.len();
-    output.write_all(&u64::to_be_bytes(n_levels as u64))?;
+    output.write_all(&u64::to_le_bytes(n_levels as u64))?;
     offset += 8;
     let mut level_offsets = vec![];
     for ld in level_descriptions[0..n_levels - 1].iter() {
@@ -605,20 +605,12 @@ pub fn write_index<R: Read, W: Write + Seek>(
     // STEP 2c: merge sort the in-memory and staging node-list chunks to form the
     //           last (leaf) level of the B+tree.
     //          save the keys and offsets of leaves which begin a leaf block
-    let mut readers: Vec<&mut dyn Iterator<Item = std::io::Result<(u64, u64, u32)>>> = vec![];
-    entries.sort_by_key(|e| e.0);
-    let mut entries_iter = entries.iter().copied().map(Ok);
-    let mut disk_readers: Vec<_> = staged_entry_files.into_iter().map(DiskIter::new).collect();
-    for dr in disk_readers.iter_mut() {
-        readers.push(dr)
-    }
-    readers.push(&mut entries_iter);
-
+    let mut readers: Vec<std::slice::Iter<WikidataLeaf>> =
+        entries.iter().map(|chunk| chunk.into_iter()).collect();
     let mut merge_queue = BinaryHeap::new();
     for (i, reader) in readers.iter_mut().enumerate() {
-        if let Some(item_res) = reader.next() {
-            let item = item_res?;
-            merge_queue.push(DatumWrapper(item, i));
+        if let Some(item) = reader.next() {
+            merge_queue.push(Reverse((item, i)));
         }
     }
     let mut ind_size = 0;
@@ -626,41 +618,39 @@ pub fn write_index<R: Read, W: Write + Seek>(
     let mut level_pointers = vec![];
     let leaf_level_desc = level_descriptions.last().unwrap();
     while !merge_queue.is_empty() {
-        let DatumWrapper(item, i) = merge_queue.pop().unwrap();
+        let Reverse((item, i)) = merge_queue.pop().unwrap();
         if leaf_level_desc.is_child_first_in_node(ind_size) {
-            level_keys.push(item.0);
+            level_keys.push(item.key());
             level_pointers.push(offset);
         }
-        output.write_all(&item.0.to_be_bytes())?;
-        output.write_all(&item.1.to_be_bytes())?;
-        output.write_all(&item.2.to_be_bytes())?;
+        output.write_all(&item.to_le_bytes())?;
         offset += 20;
         ind_size += 1;
 
-        if let Some(item_res) = readers[i].next() {
-            let item = item_res?;
-            merge_queue.push(DatumWrapper(item, i));
+        if let Some(item) = readers[i].next() {
+            merge_queue.push(Reverse((item, i)));
         }
     }
 
     // STEP 2d: propagate keys and pointers up the tree, one level at a time
-    for (i, ld) in level_descriptions.iter().enumerate().rev().skip(1) {
+    for level_id in (0..level_descriptions.len() - 1).rev() {
+        let ld = &level_descriptions[level_id];
         assert_eq!(level_keys.len(), ld.total_children() as usize);
         assert_eq!(level_keys.len(), level_pointers.len());
-        let _ = output.seek(SeekFrom::Start(level_offsets[i]))?;
-        offset = level_offsets[i];
+        let _ = output.seek(SeekFrom::Start(level_offsets[level_id]))?;
+        offset = level_offsets[level_id];
         let mut j = 0;
         let mut next_level_keys = vec![];
         let mut next_level_pointers = vec![];
         for sz in ld.node_sizes() {
             next_level_keys.push(level_keys[j]);
             next_level_pointers.push(offset);
-            output.write_all(&(sz as u64).to_be_bytes())?;
+            output.write_all(&(sz as u64).to_le_bytes())?;
             for child_num in 1..(sz as usize) {
-                output.write_all(&level_keys[j + child_num].to_be_bytes())?;
+                output.write_all(&level_keys[j + child_num].to_le_bytes())?;
             }
             for child_num in 0..(sz as usize) {
-                output.write_all(&level_pointers[j + child_num].to_be_bytes())?;
+                output.write_all(&level_pointers[j + child_num].to_le_bytes())?;
             }
             offset += 16 * sz as u64;
             j += sz as usize;
@@ -673,84 +663,87 @@ pub fn write_index<R: Read, W: Write + Seek>(
         .map_err(|e| std::io::Error::from(e).into())
 }
 
+/// STEP 3: make propery-to-entity index
+///
+/// ```ascii
+/// header  = n_props
+/// props   = [(entity_count, byte_offset)] * (n_props+1)
+///           so that [props[i].byte_offset .. props[i+1].byte_offset] lists entity IDs
+///           with property P{i}.
+/// data    = entity IDs (currently just u64s, but delta encoding would be more compact)
+/// ```
+pub fn write_prop_index<W: Write + Seek>(
+    entries: Vec<&[(u64, u64)]>,
+    prop_max_id: u64,
+    file: W,
+) -> Result<W> {
+    let mut output = BufWriter::with_capacity(131072, file);
+    let n_props = (prop_max_id & ENTITY_NUM_MASK) + 1;
+
+    // STEP 3a: write header, then write a placeholder for the array of prop metadata
+    let mut offset: u64 = 0;
+    output.write_all(&n_props.to_le_bytes())?;
+    offset += 8;
+    let zeros = vec![0; 16 * (n_props + 1) as usize];
+    output.write_all(&zeros)?;
+    offset += zeros.len() as u64;
+
+    // STEP 3b: merge sort the in-memory and staging (prop_id, entity_id) chunks to form the
+    //          last (leaf) level of the B+tree.
+    //          save the keys and offsets of leaves which begin a leaf block
+    let mut readers: Vec<std::slice::Iter<(u64, u64)>> =
+        entries.iter().map(|chunk| chunk.into_iter()).collect();
+    let mut merge_queue = BinaryHeap::new();
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(item) = reader.next() {
+            merge_queue.push(Reverse((item, i)));
+        }
+    }
+    let mut ent_list_offsets: Vec<u64> = vec![offset];
+    let mut prop_cardinalities: Vec<u64> = vec![];
+    let mut prop_card: u64 = 0;
+    let mut last_prop_id = (b'P' as u64) << ENTITY_KIND_SHIFT;
+    while !merge_queue.is_empty() {
+        let Reverse(((prop_id, ent_id), i)) = merge_queue.pop().unwrap();
+        while last_prop_id < *prop_id {
+            ent_list_offsets.push(offset);
+            prop_cardinalities.push(prop_card);
+            prop_card = 0;
+            last_prop_id += 1;
+        }
+
+        output.write_all(&ent_id.to_le_bytes())?;
+        offset += 8;
+        prop_card += 1;
+
+        if let Some(item) = readers[i].next() {
+            merge_queue.push(Reverse((item, i)));
+        }
+    }
+    prop_cardinalities.push(prop_card);
+    if last_prop_id != prop_max_id {
+        return Err(ErrorKind::Msg(format!(
+            "want prop_max_id = {}, got {}",
+            prop_max_id, last_prop_id
+        ))
+        .into());
+    }
+
+    let _ = output.seek(SeekFrom::Start(8))?;
+    for (card, el_offset) in prop_cardinalities.into_iter().zip(ent_list_offsets.into_iter()) {
+        output.write_all(&card.to_le_bytes())?;
+        output.write_all(&el_offset.to_le_bytes())?;
+    }
+    output.write_all(&[0u8; 8])?;
+    output.write_all(&offset.to_le_bytes())?;
+    output
+        .into_inner()
+        .map_err(|e| std::io::Error::from(e).into())
+}
+
+#[cfg(test)]
 mod tests {
-    use std::io::{Seek, Write};
-
-    #[derive(Default)]
-    struct SeekableVec {
-        offset: usize,
-        inner: Vec<u8>,
-    }
-
-    impl Write for SeekableVec {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            // self.offset <= self.inner.len() must be maintained
-            let overwrite = self.inner.len() - self.offset;
-            let sz = buf.len();
-            if overwrite > 0 {
-                if overwrite < sz {
-                    // SAFETY: overwrite equals the length of `self.offset..`
-                    // overwrite > 0 -> self.offset < self.inner.len()
-                    unsafe {
-                        self.inner
-                            .get_unchecked_mut(self.offset..)
-                            .copy_from_slice(&buf[..overwrite]);
-                    }
-                    self.inner.extend_from_slice(&buf[overwrite..]);
-                } else {
-                    unsafe {
-                        self.inner
-                            .get_unchecked_mut(self.offset..self.offset + sz)
-                            .copy_from_slice(buf);
-                    }
-                }
-            } else {
-                self.inner.extend_from_slice(buf);
-            }
-
-            self.offset += sz;
-            Ok(sz)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Seek for SeekableVec {
-        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-            match pos {
-                std::io::SeekFrom::Start(v) => {
-                    let val = v.try_into().map_err(|_| std::io::ErrorKind::InvalidInput)?;
-                    if val < self.inner.len() {
-                        self.offset = val;
-                        return Ok(v);
-                    }
-                    Err(std::io::ErrorKind::InvalidInput.into())
-                }
-                std::io::SeekFrom::End(off) => {
-                    let v = u64::try_from(self.inner.len() as i64 + off)
-                        .map_err(|_| std::io::ErrorKind::InvalidInput)?;
-                    let val = v.try_into().map_err(|_| std::io::ErrorKind::InvalidInput)?;
-                    if val < self.inner.len() {
-                        self.offset = val;
-                        return Ok(v);
-                    }
-                    Err(std::io::ErrorKind::InvalidInput.into())
-                }
-                std::io::SeekFrom::Current(off) => {
-                    let v = u64::try_from(self.offset as i64 + off)
-                        .map_err(|_| std::io::ErrorKind::InvalidInput)?;
-                    let val = v.try_into().map_err(|_| std::io::ErrorKind::InvalidInput)?;
-                    if val < self.inner.len() {
-                        self.offset = val;
-                        return Ok(v);
-                    }
-                    Err(std::io::ErrorKind::InvalidInput.into())
-                }
-            }
-        }
-    }
+    use crate::querier::WikidataLeaf;
 
     struct IndexReader<'a> {
         data: &'a [u8],
@@ -761,31 +754,31 @@ mod tests {
             Self { data }
         }
 
-        fn be_to_u64(src: &[u8]) -> u64 {
+        fn le_to_u64(src: &[u8]) -> u64 {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(src);
-            u64::from_be_bytes(buf)
+            u64::from_le_bytes(buf)
         }
 
-        fn be_to_leafdata(src: &[u8]) -> (u64, u64, u32) {
+        fn le_to_leafdata(src: &[u8]) -> (u64, u64, u32) {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&src[..8]);
-            let a = u64::from_be_bytes(buf);
+            let a = u64::from_le_bytes(buf);
             buf.copy_from_slice(&src[8..16]);
-            let b = u64::from_be_bytes(buf);
+            let b = u64::from_le_bytes(buf);
             let mut buf = [0u8; 4];
             buf.copy_from_slice(&src[16..]);
-            (a, b, u32::from_be_bytes(buf))
+            (a, b, u32::from_le_bytes(buf))
         }
 
         fn n_groups(&self) -> u64 {
-            Self::be_to_u64(&self.data[..8])
+            Self::le_to_u64(&self.data[..8])
         }
 
         fn group_offsets(&self, n_groups: u64) -> Vec<u64> {
             self.data[8..]
                 .chunks_exact(8)
-                .map(Self::be_to_u64)
+                .map(Self::le_to_u64)
                 .take(n_groups as usize)
                 .collect()
         }
@@ -800,13 +793,13 @@ mod tests {
             let mut res = vec![];
             let mut n_ptrs = 0;
             for _ in 0..n_nodes {
-                let w = Self::be_to_u64(&self.data[base..base + 8]);
+                let w = Self::le_to_u64(&self.data[base..base + 8]);
                 n_ptrs += w;
                 let w = w as usize;
                 res.extend(
                     self.data[base..]
                         .chunks_exact(8)
-                        .map(Self::be_to_u64)
+                        .map(Self::le_to_u64)
                         .take(2 * w),
                 );
                 base += 16 * w;
@@ -818,7 +811,7 @@ mod tests {
             let base = pos as usize;
             self.data[base..]
                 .chunks_exact(20)
-                .map(Self::be_to_leafdata)
+                .map(Self::le_to_leafdata)
                 .collect()
         }
     }
@@ -826,11 +819,10 @@ mod tests {
     #[test]
     #[rustfmt::skip]
     fn write_index_one_level() -> super::Result<()> {
-        let ind_entries = (1u64..=20).map(|k| (k, k + 64, 1u32)).collect();
+        let ind_entries: Vec<_> = (1u64..=20).map(|k| WikidataLeaf::new(k, k + 64, 1u32)).collect();
         let group_offsets = vec![0, 1000, 2000, 3000];
-        let staged_entry_files: Vec<std::fs::File> = vec![];
-        let actual = super::write_index(ind_entries, group_offsets, staged_entry_files, 0, SeekableVec::default())?;
-        let ir = IndexReader::new(&actual.inner);
+        let actual = super::write_index(vec![&ind_entries], group_offsets, std::io::Cursor::new(Vec::new()))?.into_inner();
+        let ir = IndexReader::new(&actual);
         let n_groups = ir.n_groups();
         assert_eq!(n_groups, 4);
         assert_eq!(ir.group_offsets(n_groups), vec![0, 1000, 2000, 3000]);
@@ -862,11 +854,14 @@ mod tests {
     #[test]
     #[rustfmt::skip]
     fn write_index_two_levels() -> super::Result<()> {
-        let ind_entries = (1u64..=601).map(|k| (k, k + 64, 1u32)).collect();
+        let ind_entries: Vec<_> = (1u64..=601).map(|k| WikidataLeaf::new(k, k + 64, 1u32)).collect();
         let group_offsets = vec![0, 1000, 2000, 3000];
-        let staged_entry_files: Vec<std::fs::File> = vec![];
-        let actual = super::write_index(ind_entries, group_offsets, staged_entry_files, 0, SeekableVec::default())?;
-        let ir = IndexReader::new(&actual.inner);
+        let actual = super::write_index(
+            vec![&ind_entries[..200], &ind_entries[200..400], &ind_entries[400..]],
+            group_offsets,
+            std::io::Cursor::new(Vec::new()),
+        )?.into_inner();
+        let ir = IndexReader::new(&actual);
         let n_groups = ir.n_groups();
         assert_eq!(n_groups, 4);
         assert_eq!(ir.group_offsets(n_groups), vec![0, 1000, 2000, 3000]);

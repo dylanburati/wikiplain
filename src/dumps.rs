@@ -21,7 +21,7 @@ use parquet::{
     arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties,
     schema::types::ColumnPath,
 };
-use pyo3::{IntoPy, PyObject, types::PyBytes};
+use pyo3::{types::PyBytes, IntoPy, PyObject};
 use quick_xml::events::{BytesStart, BytesText, Event};
 
 use crate::{ErrorKind, Result, ResultExt};
@@ -444,13 +444,13 @@ impl IntoPy<PyObject> for SqlLiteral {
                 let rep = x.integral + "." + &x.fractional;
                 let v: f64 = rep.parse().unwrap_or(f64::NAN);
                 v.into_py(py)
-            },
+            }
             nom_sql::Literal::String(s) => s.into_py(py),
             nom_sql::Literal::Blob(b) => PyBytes::new(py, &b).into_py(py),
             nom_sql::Literal::CurrentTime => py.None(),
             nom_sql::Literal::CurrentDate => py.None(),
             nom_sql::Literal::CurrentTimestamp => py.None(),
-            nom_sql::Literal::Placeholder => py.None(), 
+            nom_sql::Literal::Placeholder => py.None(),
         }
     }
 }
@@ -459,11 +459,13 @@ pub fn parse_sql_insert_statement(text: &[u8]) -> Result<(String, Vec<Vec<SqlLit
     let query = parse_query_bytes(text).map_err(|m| ErrorKind::SQLParseError(m))?;
     match query {
         nom_sql::SqlQuery::Insert(statement) => {
-            let data = statement.data.into_iter().map(|tpl| tpl.into_iter().map(SqlLiteral).collect()).collect();
+            let data = statement
+                .data
+                .into_iter()
+                .map(|tpl| tpl.into_iter().map(SqlLiteral).collect())
+                .collect();
             Ok((statement.table.to_string(), data))
         }
-        _ => {
-            Err(ErrorKind::InvalidArgument("not an insert statement".into()).into()) 
-        }    
+        _ => Err(ErrorKind::InvalidArgument("not an insert statement".into()).into()),
     }
 }

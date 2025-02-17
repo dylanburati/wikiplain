@@ -12,7 +12,7 @@ use nom::{
     combinator::{all_consuming, fail, map, map_opt, recognize, value},
     multi::many0,
     sequence::{delimited, preceded, terminated},
-    IResult, InputIter, Offset,
+    IResult, InputIter,
 };
 use regex::Regex;
 
@@ -25,7 +25,6 @@ pub enum Token<'a> {
     TemplateEnd,
     LinkStart,
     LinkEnd,
-    /// Stores (name, is_self_closing)
     ElementStart(String, bool),
     ElementEnd(String),
     Content(&'a str),
@@ -78,51 +77,13 @@ fn parse_name_lower(i: &str) -> IResult<&str, String> {
     map(parse_name, |s| s.to_ascii_lowercase())(i)
 }
 
-fn parse_content(inp: &str) -> IResult<&str, Token> {
-    let len = inp.len();
-    if len == 0 {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            inp,
-            nom::error::ErrorKind::TakeWhile1,
-        )));
-    }
-    let mut prev = '\0';
-    for (i, c) in inp.iter_indices() {
-        let breakpoint = match c {
-            '<' => {
-                if i > 0 {
-                    Some(i)
-                } else {
-                    // already failed to parse this as an element; default to content
-                    None
-                }
-            }
-            '{' | '}' | '[' | ']' => {
-                if prev == c {
-                    Some(i - 1)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some(consumed) = breakpoint {
-            if consumed == 0 {
-                return Err(nom::Err::Error(nom::error::Error::new(
-                    inp,
-                    nom::error::ErrorKind::TakeWhile1,
-                )));
-            }
-            let tok = Token::Content(&inp[..consumed]);
-            return Ok((&inp[consumed..], tok));
-        }
-        prev = c;
-    }
-
-    let tok = Token::Content(&inp[..len]);
-    return Ok((&inp[len..], tok));
+fn is_special(c: char) -> bool {
+    c == '<' || c == '{' || c == '}' || c == '[' || c == ']'
 }
 
+fn parse_content(i: &str) -> IResult<&str, &str> {
+    take_till(is_special)(i)
+}
 
 fn parse_token(i: &str) -> IResult<&str, Token> {
     alt((
@@ -131,7 +92,7 @@ fn parse_token(i: &str) -> IResult<&str, Token> {
         map(tag("}}"), |_| Token::TemplateEnd),
         map(tag("[["), |_| Token::LinkStart),
         map(tag("]]"), |_| Token::LinkEnd),
-        parse_content,
+        map(recognize(preceded(anychar, parse_content)), Token::Content),
     ))(i)
 }
 
@@ -205,30 +166,9 @@ fn parse_begin(i: &str) -> IResult<&str, Token> {
 }
 
 pub fn tokenize(text: &str) -> Result<Vec<Token>> {
-    let mut result = vec![];
-    let blocks = preprocess(text)?;
-    for block in blocks {
-        match block {
-            WikitextBlock::Verbatim { element_name, content } => {
-                result.push(Token::ElementStart(element_name.clone(), false));
-                result.push(Token::Content(content));
-                result.push(Token::ElementEnd(element_name));
-            },
-            WikitextBlock::Heading { level, content } => {
-                let (_, tokens) = all_consuming(many0(parse_token))(content)
-                    .map_err(|e| Error::from(ErrorKind::WikitextParseError(e.to_string())))?;
-                result.push(Token::ElementStart(format!("h{}", level), false));
-                result.extend(tokens);
-                result.push(Token::ElementEnd(format!("h{}", level)));
-            },
-            WikitextBlock::Body { content } => {
-                let (_, tokens) = all_consuming(many0(parse_token))(content)
-                    .map_err(|e| Error::from(ErrorKind::WikitextParseError(e.to_string())))?;
-                result.extend(tokens);
-            },
-        }
-    }
-    Ok(result)
+    let (_, tokens) = all_consuming(many0(parse_token))(text)
+        .map_err(|e| Error::from(ErrorKind::WikitextParseError(e.to_string())))?;
+    Ok(tokens)
 }
 
 struct WikiPageContext<'a> {
@@ -386,162 +326,6 @@ pub fn get_links(text: &str) -> Result<Vec<String>> {
             _ => continue,
         }
     }
-    Ok(result)
-}
-
-enum WikitextBlock<'a> {
-    Verbatim {
-        element_name: String,
-        content: &'a str,
-    },
-    Heading {
-        level: usize,
-        content: &'a str,
-    },
-    Body {
-        content: &'a str,
-    },
-}
-
-fn preprocess(text: &str) -> Result<Vec<WikitextBlock>> {
-    let mut acc = vec![];
-    let mut open_tag = None;
-    let mut acced = 0;
-    let mut inp = text;
-    while !inp.is_empty() {
-        let len = inp.len();
-        let res = alt((
-            preceded(char('<'), parse_langle),
-            map(recognize(preceded(anychar, take_till(|c| c == '<'))), Token::Content),
-        ))(inp);
-        match res {
-            Err(e) => return Err(ErrorKind::WikitextParseError(e.to_string()).into()),
-            Ok((i1, tok)) => {
-                // infinite loop check: the parser must always consume
-                if i1.len() == len {
-                    return Err(ErrorKind::WikitextParseError(format!(
-                        "alt parser consumed nothing"
-                    ))
-                    .into());
-                }
-
-                match tok {
-                    Token::ElementStart(tag, false) if is_syntax_override(&tag) => {
-                        if open_tag.is_none() {
-                            let needs_acc = text.offset(inp);
-                            acc.push(WikitextBlock::Body {
-                                content: &text[acced..needs_acc],
-                            });
-                            open_tag = Some(tag);
-                            acced = text.offset(i1);
-                        }
-                    }
-                    Token::ElementEnd(tag) if is_syntax_override(&tag) => {
-                        if let Some(ot) = open_tag.take() {
-                            if tag == ot {
-                                let needs_acc = text.offset(inp);
-                                acc.push(WikitextBlock::Verbatim {
-                                    element_name: tag,
-                                    content: &text[acced..needs_acc],
-                                });
-                                acced = text.offset(i1);
-                            } else {
-                                open_tag = Some(ot)
-                            }
-                        } else {
-                            // interpret as self-closing tag
-                            let needs_acc = text.offset(inp);
-                            acc.push(WikitextBlock::Body {
-                                content: &text[acced..needs_acc],
-                            });
-                            acc.push(WikitextBlock::Verbatim {
-                                element_name: tag,
-                                content: Default::default(),
-                            });
-                            acced = text.offset(i1);
-                        }
-                    }
-                    _ => {}
-                }
-
-                inp = i1;
-            }
-        }
-    }
-    if let Some(ot) = open_tag {
-        acc.push(WikitextBlock::Verbatim {
-            element_name: ot,
-            content: &text[acced..],
-        });
-    } else {
-        acc.push(WikitextBlock::Body {
-            content: &text[acced..],
-        });
-    }
-
-    let result = acc
-        .into_iter()
-        .flat_map(|block| match block {
-            WikitextBlock::Verbatim { .. } => vec![block],
-            WikitextBlock::Heading { .. } => vec![block],
-            WikitextBlock::Body { content } => {
-                let mut blocks = vec![];
-                let mut blocked = 0;
-                let mut idx = 0;
-                for line in content.split_inclusive('\n') {
-                    let next_idx = idx + line.len();
-                    if let Some(rest) = line.strip_prefix("=").and_then(|s| s.strip_suffix("\n")) {
-                        let (leading, start_idx) = rest
-                            .as_bytes()
-                            .iter()
-                            .copied()
-                            .take_while(|&c| c == b'=' || c == b' ' || c == b'\t')
-                            .fold((1, 0), |(x, y), c| {
-                                if c == b'=' {
-                                    (x + 1, y + 1)
-                                } else {
-                                    (x, y + 1)
-                                }
-                            });
-                        if start_idx < rest.len() {
-                            let (trailing, end_idx) = rest
-                                .as_bytes()
-                                .iter()
-                                .copied()
-                                .rev()
-                                .take_while(|&c| c == b'=' || c == b' ' || c == b'\t')
-                                .fold((0, rest.len()), |(x, y), c| {
-                                    if c == b'=' {
-                                        (x + 1, y - 1)
-                                    } else {
-                                        (x, y - 1)
-                                    }
-                                });
-                            if leading == trailing {
-                                if idx > blocked {
-                                    blocks.push(WikitextBlock::Body {
-                                        content: &content[blocked..idx],
-                                    });
-                                }
-                                blocks.push(WikitextBlock::Heading {
-                                    level: leading,
-                                    content: &rest[start_idx..end_idx],
-                                });
-                                blocked = next_idx;
-                            }
-                        }
-                    }
-                    idx = next_idx;
-                }
-                if blocked < content.len() {
-                    blocks.push(WikitextBlock::Body {
-                        content: &content[blocked..],
-                    });
-                }
-                blocks
-            }
-        })
-        .collect();
     Ok(result)
 }
 

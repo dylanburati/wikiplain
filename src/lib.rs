@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::ops::Deref;
 
 use error_chain::error_chain;
-use pyo3::{exceptions::PyValueError, prelude::*, PyRef, wrap_pyfunction};
+use pyo3::{exceptions::PyValueError, prelude::*, wrap_pyfunction, PyRef};
 
 mod dumps;
 mod wikitext;
@@ -49,7 +49,8 @@ error_chain! {
 /// Load a Wikimedia XML dump into a parquet file.
 #[pyfunction]
 fn load_bz2(dump_path: &str, output_path: &str) -> PyResult<()> {
-    dumps::load_pages_articles(dump_path, output_path).map_err(|err| PyValueError::new_err(err.to_string()))
+    dumps::load_pages_articles(dump_path, output_path)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 /// Parse a SQL insert statement and get the table name and list of rows to insert.
@@ -306,7 +307,8 @@ fn get_first_infobox_title(text: &str) -> PyResult<Option<String>> {
 /// must be capitalized).
 #[pyfunction]
 fn get_templates_by_name(text: &str, names: Vec<String>) -> PyResult<Vec<String>> {
-    wikitext::get_templates_by_name(text, names).map_err(|err| PyValueError::new_err(err.to_string()))
+    wikitext::get_templates_by_name(text, names)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 fn sql_module(py: Python, parent_module: &PyModule) -> PyResult<()> {
