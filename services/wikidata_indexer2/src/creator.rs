@@ -327,6 +327,44 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
     Ok(())
 }
 
+pub fn fixme() -> Result<()> {
+    let file_stg_secondary = OpenOptions::new()
+        .read(true)
+        .open("/tmp/nix-shell.VnXtlO/1739770159612.bin2")?;
+
+    let mut stg_secondary_entries = vec![];
+    let stg_secondary_bytes = unsafe { Mmap::map(&file_stg_secondary) }?;
+    let mut stg_secondary_offset = 0;
+    let stride = std::mem::size_of::<(u64, u64)>();
+    while (stg_secondary_offset + stride * STG_BLOCK_LIMIT) <= stg_secondary_bytes.len() {
+        let entry_chunk: &[(u64, u64)] = unsafe {
+            std::slice::from_raw_parts(
+                std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
+                STG_BLOCK_LIMIT,
+            )
+        };
+        stg_secondary_entries.push(entry_chunk);
+        stg_secondary_offset += stride * STG_BLOCK_LIMIT;
+    }
+    let remaining_len = (stg_secondary_bytes.len() - stg_secondary_offset) / stride;
+    let last_chunk: &[(u64, u64)] = unsafe {
+        std::slice::from_raw_parts(
+            std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
+            remaining_len,
+        )
+    };
+    let mut last_chunk = last_chunk.to_owned();
+    last_chunk.sort();
+    stg_secondary_entries.push(&last_chunk[..]);
+    let file_prop_ind = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("/home/dylan/Downloads/zwikidata-20250127-prop.index.bin")?;
+    let _ = write_prop_index(stg_secondary_entries, 0x5000_0000_0000_33c1, file_prop_ind)?;
+    Ok(())
+}
+
 /// STEP 0: train the compressor and create a dictionary which will be shared for all items
 fn get_zstd_dicts(file_input: File, dict_sender: SyncSender<Vec<u8>>) -> Result<()> {
     let mut input = MultiGzDecoder::new(file_input);
@@ -679,13 +717,11 @@ pub fn write_index<W: Write + Seek>(
 /// STEP 2: make propery-to-entity index
 ///
 /// ```ascii
-/// header  = len(props)
-/// props   = [P0 = (entity_count, byte_offset), ..., P{one-past-last} = (0, byte_offset)]
-///           where 2 <= W <= 256                       :'---------------------------------.
-/// level _ = nodes [(width=W, [W-1] keys, [W] ptrs)] | N                                  N
-///           where 128 <= W <= 256                     :'--------.---------.---[W times]# :
-///                                                     :         :         :            # :
-/// level N = leaves [(key, entity_start)]            | L-L-L-L # L-L-L-L # L-L- etc     # L etc
+/// header  = n_props
+/// props   = [(entity_count, byte_offset)] * (n_props+1)
+///           so that [props[i].byte_offset .. props[i+1].byte_offset] lists entity IDs
+///           with property P{i}.
+/// data    = entity IDs (currently just u64s, but delta encoding would be more compact)
 /// ```
 pub fn write_prop_index<W: Write + Seek>(
     entries: Vec<&[(u64, u64)]>,
@@ -704,7 +740,7 @@ pub fn write_prop_index<W: Write + Seek>(
     offset += zeros.len() as u64;
 
     // STEP 3b: merge sort the in-memory and staging (prop_id, entity_id) chunks to form the
-    //           last (leaf) level of the B+tree.
+    //          last (leaf) level of the B+tree.
     //          save the keys and offsets of leaves which begin a leaf block
     let mut readers: Vec<std::slice::Iter<(u64, u64)>> =
         entries.iter().map(|chunk| chunk.into_iter()).collect();
@@ -714,31 +750,28 @@ pub fn write_prop_index<W: Write + Seek>(
             merge_queue.push((item, i));
         }
     }
-    let mut metadata = vec![];
-    let mut entity_ids: Vec<u64> = vec![];
-    let mut last_prop_id: u64 = 0;
+    let mut ent_list_offsets: Vec<u64> = vec![offset];
+    let mut prop_cardinalities: Vec<u64> = vec![];
     let mut prop_card: u64 = 0;
+    let mut last_prop_id = (b'P' as u64) << ENTITY_KIND_SHIFT;
     while !merge_queue.is_empty() {
-        let (item, i) = merge_queue.pop().unwrap();
-        while last_prop_id < item.0 {
-            metadata.push((prop_card, offset));
+        let ((prop_id, ent_id), i) = merge_queue.pop().unwrap();
+        while last_prop_id < *prop_id {
+            ent_list_offsets.push(offset);
+            prop_cardinalities.push(prop_card);
             prop_card = 0;
-            if !entity_ids.is_empty() {
-                offset += std::mem::size_of_val(&entity_ids[..]) as u64;
-                for v in entity_ids.iter() {
-                    output.write_all(&v.to_le_bytes())?;
-                }
-                entity_ids.clear();
-            }
             last_prop_id += 1;
         }
 
+        output.write_all(&ent_id.to_le_bytes())?;
+        offset += 8;
         prop_card += 1;
-        entity_ids.push(item.1);
+
         if let Some(item) = readers[i].next() {
             merge_queue.push((item, i));
         }
     }
+    prop_cardinalities.push(prop_card);
     if last_prop_id != prop_max_id {
         return Err(ErrorKind::Msg(format!(
             "want prop_max_id = {}, got {}",
@@ -746,18 +779,14 @@ pub fn write_prop_index<W: Write + Seek>(
         ))
         .into());
     }
-    metadata.push((prop_card, offset));
-    offset += std::mem::size_of_val(&entity_ids[..]) as u64;
-    for v in &entity_ids {
-        output.write_all(&v.to_le_bytes())?;
-    }
-    metadata.push((0, offset));
 
     let _ = output.seek(SeekFrom::Start(8))?;
-    for (card, offset) in metadata {
+    for (card, el_offset) in prop_cardinalities.into_iter().zip(ent_list_offsets.into_iter()) {
         output.write_all(&card.to_le_bytes())?;
-        output.write_all(&offset.to_le_bytes())?;
+        output.write_all(&el_offset.to_le_bytes())?;
     }
+    output.write_all(&[0u8; 8])?;
+    output.write_all(&offset.to_le_bytes())?;
     output
         .into_inner()
         .map_err(|e| std::io::Error::from(e).into())
