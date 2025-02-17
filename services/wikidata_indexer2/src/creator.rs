@@ -327,44 +327,6 @@ pub fn create(input_path: &str, output_path: &str, working_path: &str) -> Result
     Ok(())
 }
 
-pub fn fixme() -> Result<()> {
-    let file_stg_secondary = OpenOptions::new()
-        .read(true)
-        .open("/tmp/nix-shell.VnXtlO/1739770159612.bin2")?;
-
-    let mut stg_secondary_entries = vec![];
-    let stg_secondary_bytes = unsafe { Mmap::map(&file_stg_secondary) }?;
-    let mut stg_secondary_offset = 0;
-    let stride = std::mem::size_of::<(u64, u64)>();
-    while (stg_secondary_offset + stride * STG_BLOCK_LIMIT) <= stg_secondary_bytes.len() {
-        let entry_chunk: &[(u64, u64)] = unsafe {
-            std::slice::from_raw_parts(
-                std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
-                STG_BLOCK_LIMIT,
-            )
-        };
-        stg_secondary_entries.push(entry_chunk);
-        stg_secondary_offset += stride * STG_BLOCK_LIMIT;
-    }
-    let remaining_len = (stg_secondary_bytes.len() - stg_secondary_offset) / stride;
-    let last_chunk: &[(u64, u64)] = unsafe {
-        std::slice::from_raw_parts(
-            std::mem::transmute(stg_secondary_bytes.as_ptr().add(stg_secondary_offset)),
-            remaining_len,
-        )
-    };
-    let mut last_chunk = last_chunk.to_owned();
-    last_chunk.sort();
-    stg_secondary_entries.push(&last_chunk[..]);
-    let file_prop_ind = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("/home/dylan/Downloads/zwikidata-20250127-prop.index.bin")?;
-    let _ = write_prop_index(stg_secondary_entries, 0x5000_0000_0000_33c1, file_prop_ind)?;
-    Ok(())
-}
-
 /// STEP 0: train the compressor and create a dictionary which will be shared for all items
 fn get_zstd_dicts(file_input: File, dict_sender: SyncSender<Vec<u8>>) -> Result<()> {
     let mut input = MultiGzDecoder::new(file_input);
@@ -558,20 +520,6 @@ fn write_segmented(
                     .map_err(std::io::Error::from)?,
             );
         }
-        // FIXME
-        if eof && prop_ind_entries.len() > 0 {
-            let mut output_stg_secondary =
-                BufWriter::with_capacity(131072, file_stg_secondary.take().unwrap());
-            for (k, eid) in prop_ind_entries.iter() {
-                output_stg_secondary.write_all(&k.to_le_bytes())?;
-                output_stg_secondary.write_all(&eid.to_le_bytes())?;
-            }
-            let _ = file_stg_secondary.insert(
-                output_stg_secondary
-                    .into_inner()
-                    .map_err(std::io::Error::from)?,
-            );
-        }
     }
     output_en.flush()?;
 
@@ -714,7 +662,7 @@ pub fn write_index<W: Write + Seek>(
         .map_err(|e| std::io::Error::from(e).into())
 }
 
-/// STEP 2: make propery-to-entity index
+/// STEP 3: make propery-to-entity index
 ///
 /// ```ascii
 /// header  = n_props
