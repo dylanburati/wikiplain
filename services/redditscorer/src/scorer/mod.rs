@@ -1,16 +1,22 @@
 use std::{
-    fs::{File, OpenOptions}, io::{BufRead, BufReader, BufWriter, Seek, Write}, ops::{Add, Rem}, os::fd::{AsRawFd, FromRawFd}, path::PathBuf, rc::Rc, result::Result as StdResult, sync::{Arc, Mutex}, time::{Duration, Instant}
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, BufWriter, Write},
+    ops::Add,
+    path::PathBuf,
+    result::Result as StdResult,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
 use caches::{Cache, LRUCache};
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use itertools::Itertools;
-use nalgebra::{DMatrix, DVector, Matrix};
+use nalgebra::{DMatrix, DVector};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use redis::Commands;
-use rusqlite::{Connection, ParamsFromIter};
+use rusqlite::Connection;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use zstd::stream::Decoder;
@@ -118,6 +124,7 @@ struct WorkerContext {
     pos_model: Arc<Mutex<AveragedPerceptron>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ProgressMsg {
     task_id: String,
@@ -133,23 +140,27 @@ struct SubmissionMeta {
     title: Option<String>,
 }
 
-fn produce_titles(reader_ctx: ReaderContext, titles_push: Sender<Vec<String>>, progress_push: Arc<Sender<ProgressMsg>>) -> Result<()> {
+fn produce_titles(
+    reader_ctx: ReaderContext,
+    titles_push: Sender<Vec<String>>,
+    progress_push: Arc<Sender<ProgressMsg>>,
+) -> Result<()> {
     let sqlconn = Connection::open(&reader_ctx.db_path)?;
     let mut top_domains_stmt = sqlconn.prepare("SELECT k FROM top_domains")?;
     let mut top_domains_iter = top_domains_stmt.query_map((), |row| {
         let k: String = row.get(0)?;
         Ok(k)
     })?;
-    let domains =
-        top_domains_iter.try_fold(FxHashSet::default(), |mut acc, res| -> Result<_> {
-            let k = res?;
-            acc.insert(k);
-            Ok(acc)
-        })?;
+    let domains = top_domains_iter.try_fold(FxHashSet::default(), |mut acc, res| -> Result<_> {
+        let k = res?;
+        acc.insert(k);
+        Ok(acc)
+    })?;
 
-    let mut stream = Decoder::new(reader_ctx.file)?;
+    let stream = BufReader::with_capacity(256 * 1024, reader_ctx.file);
+    let mut stream = Decoder::new(stream)?;
     stream.window_log_max(31)?;
-    let stream = BufReader::with_capacity(65536, stream);
+    let stream = BufReader::new(stream);
     let mut dedup_cache: LRUCache<String, (), _> =
         LRUCache::new(64 * 1024).expect("can not create LRU cache");
 
@@ -221,18 +232,25 @@ fn produce_titles(reader_ctx: ReaderContext, titles_push: Sender<Vec<String>>, p
             title_batch.push(title.to_string());
             if title_batch.len() >= title_batch_size {
                 titles_sent += title_batch.len();
-                progress_push.send(ProgressMsg { task_id: reader_ctx.task_id.clone(), titles: titles_sent, bytes: 0 })?;
+                progress_push.send(ProgressMsg {
+                    task_id: reader_ctx.task_id.clone(),
+                    titles: titles_sent,
+                    bytes: 0,
+                })?;
 
                 let mut send_batch = Vec::with_capacity(title_batch_size);
                 std::mem::swap(&mut title_batch, &mut send_batch);
                 titles_push.send(send_batch)?;
-
             }
         }
     }
     if title_batch.len() > 0 {
         titles_sent += title_batch.len();
-        progress_push.send(ProgressMsg { task_id: reader_ctx.task_id.clone(), titles: titles_sent, bytes: 0 })?;
+        progress_push.send(ProgressMsg {
+            task_id: reader_ctx.task_id.clone(),
+            titles: titles_sent,
+            bytes: 0,
+        })?;
         titles_push.send(title_batch)?;
     }
 
@@ -330,26 +348,27 @@ fn consume_titles(
 
         let all_terms: FxHashSet<_> = span_lists.iter().flat_map(SpanList::all).collect();
         let all_terms_count = all_terms.len();
-        let all_terms: Vec<_> =
-            all_terms
-                .into_iter()
-                .collect() ;
+        let all_terms: Vec<_> = all_terms.into_iter().collect();
         let postings_raw: Vec<Vec<u8>> = rconn.mget(&all_terms)?;
-        let postings: FxHashMap<_, _> = all_terms.into_iter().zip(postings_raw.iter()).map(|(k, vb)| {
-            if std::mem::size_of::<WeightEntry>() != 8 {
-                panic!("static assert failed")
-            }
-            let len = vb.len() / 8;
-            if vb.len() % 8 != 0 {
-                panic!("redis corrupted: {}", k);
-            }
-            let v: &[WeightEntry] = unsafe {
-                let byte_ptr = vb.as_slice().as_ptr();
-                let entry_ptr: *const WeightEntry = std::mem::transmute(byte_ptr);
-                std::slice::from_raw_parts(entry_ptr, len)
-            };
-            (k, v)
-        }).collect();
+        let postings: FxHashMap<_, _> = all_terms
+            .into_iter()
+            .zip(postings_raw.iter())
+            .map(|(k, vb)| {
+                if std::mem::size_of::<WeightEntry>() != 8 {
+                    panic!("static assert failed")
+                }
+                let len = vb.len() / 8;
+                if vb.len() % 8 != 0 {
+                    panic!("redis corrupted: {}", k);
+                }
+                let v: &[WeightEntry] = unsafe {
+                    let byte_ptr = vb.as_slice().as_ptr();
+                    let entry_ptr: *const WeightEntry = std::mem::transmute(byte_ptr);
+                    std::slice::from_raw_parts(entry_ptr, len)
+                };
+                (k, v)
+            })
+            .collect();
         let dur3 = t0.elapsed();
 
         for (mut sl, taginfo) in span_lists.into_iter().zip(tag_resp) {
@@ -382,7 +401,8 @@ fn consume_titles(
             let mut score = scores.column(PENN_TAG_NNP).clone_owned();
             score.zip_apply(&scores.column(PENN_TAG_NNPS), |x, y| *x = x.max(y));
             let denominator = score.add_scalar(20.0);
-            score = (score.component_mul(&observations) + priors * 20.0).component_div(&denominator);
+            score =
+                (score.component_mul(&observations) + priors * 20.0).component_div(&denominator);
 
             while let Some((pos, width, term)) = sl.next() {
                 let Some(weights) = postings.get(&term) else {
@@ -397,8 +417,13 @@ fn consume_titles(
             }
         }
 
-        eprintln!("{} tok={} lock={} pos={} db={} math={} | qsize={}",
-            worker_ctx.file_path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or(""),
+        eprintln!(
+            "{} tok={} lock={} pos={} db={} math={} | qsize={}",
+            worker_ctx
+                .file_path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or(""),
             dur0.as_nanos(),
             (dur1 - dur0).as_nanos(),
             (dur2 - dur1).as_nanos(),
@@ -479,7 +504,7 @@ fn run_scorer_for_file(
 }
 
 pub fn run_scorer(
-    input_pattern: String,
+    input_filenames: Vec<PathBuf>,
     db_path: String,
     pos_model_path: String,
     num_articles: u32,
@@ -487,7 +512,6 @@ pub fn run_scorer(
 ) -> Result<()> {
     pyo3::prepare_freethreaded_python();
 
-    let input_filenames = glob::glob(&input_pattern)?.collect::<Result<Vec<_>, _>>()?;
     let output_pattern = if output_dir.ends_with('/') {
         output_dir.clone() + "RS_*.npy"
     } else {
@@ -543,7 +567,11 @@ pub fn run_scorer(
                     let reader_ctx = ReaderContext {
                         file,
                         db_path: db_path_copy.clone(),
-                        task_id: filename.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("").to_owned()
+                        task_id: filename
+                            .file_stem()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .unwrap_or("")
+                            .to_owned(),
                     };
                     let worker_ctx = WorkerContext {
                         file_path: filename,

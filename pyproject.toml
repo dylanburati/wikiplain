@@ -31,6 +31,7 @@ httpx = {extras = ["socks"], version = "^0.26.0"}
 cbor2 = "^5.6.1"
 pypocketmap = {git = "https://github.com/dylanburati/pypocketmap.git"}
 avro = "^1.11.3"
+redis = "^5.2.1"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.1.1"

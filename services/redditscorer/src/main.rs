@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{arg, value_parser, Command};
 
@@ -18,7 +20,14 @@ fn cli() -> Command {
         .subcommand(
             Command::new("score")
                 .about("Computes a score array from each input reddit-submissions dump")
-                .arg(arg!(ipattern: -i <globpattern> "Input .zst files").required(true))
+                .arg(
+                    clap::Arg::new("inputs")
+                        .short('i')
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .action(clap::ArgAction::Set)
+                        .num_args(1..)
+                        .required(true)
+                )
                 .arg(arg!(db: --db <path> "Path to the tokenized enwiki sqlite db").required(true))
                 .arg(arg!(pos: --pos <path> "Path to the trained part-of-speech recognition model").required(true))
                 .arg(
@@ -40,14 +49,23 @@ fn main() -> Result<()> {
             todo!("{} {}", input_pattern, output_path)
         }
         Some(("score", sub_matches)) => {
-            let input_pattern = sub_matches.get_one::<String>("ipattern").unwrap().to_string();
+            let input_filenames = sub_matches
+                .get_many::<PathBuf>("inputs")
+                .unwrap()
+                .cloned()
+                .collect::<Vec<_>>();
             let db_path = sub_matches.get_one::<String>("db").unwrap().to_string();
             let pos_model_path = sub_matches.get_one::<String>("pos").unwrap().to_string();
             let num_articles = sub_matches.get_one::<u32>("size").unwrap();
             let output_dir = sub_matches.get_one::<String>("opath").unwrap().to_string();
-            scorer::run_scorer(input_pattern, db_path, pos_model_path, *num_articles, output_dir)
+            scorer::run_scorer(
+                input_filenames,
+                db_path,
+                pos_model_path,
+                *num_articles,
+                output_dir,
+            )
         }
         _ => unreachable!(),
     }
 }
-
