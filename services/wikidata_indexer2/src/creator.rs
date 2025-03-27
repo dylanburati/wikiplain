@@ -49,8 +49,8 @@ struct WikidataEntity {
     claims: Vec<u64>,
 }
 
-const ENTITY_KIND_SHIFT: u64 = 56;
-const ENTITY_NUM_MASK: u64 = (1 << 56) - 1;
+pub(crate) const ENTITY_KIND_SHIFT: u64 = 56;
+pub(crate) const ENTITY_NUM_MASK: u64 = (1 << 56) - 1;
 
 impl TryFrom<WikidataEntityJson> for WikidataEntity {
     type Error = Error;

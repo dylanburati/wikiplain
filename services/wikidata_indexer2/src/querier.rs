@@ -14,11 +14,128 @@ use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use zstd::{dict::DecoderDictionary, stream::write::Decoder};
 
-use crate::{creator::TREE_FANOUT, ErrorKind, Result};
+use crate::{
+    creator::{ENTITY_NUM_MASK, TREE_FANOUT},
+    ErrorKind, Result,
+};
 
 pub(crate) fn serve(path: &str, port: u16) -> Result<()> {
     let rt = Runtime::new()?;
     rt.block_on(serve_async(path, port))
+}
+
+#[repr(C)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct WikidataPropPtr(u64, u64);
+
+impl WikidataPropPtr {
+    #[cfg(target_endian = "little")]
+    pub(crate) fn num_entities(&self) -> usize {
+        self.0 as usize
+    }
+
+    #[cfg(target_endian = "big")]
+    fn num_entities(&self) -> usize {
+        self.0.swap_bytes() as usize
+    }
+
+    #[cfg(target_endian = "little")]
+    pub(crate) fn data_offset(&self) -> u64 {
+        self.1
+    }
+
+    #[cfg(target_endian = "big")]
+    fn data_offset(&self) -> u64 {
+        self.1.swap_bytes()
+    }
+}
+
+struct WikidataPropIndex<'a> {
+    _raw: &'a [u8],
+    ptrs: &'a [WikidataPropPtr],
+    data_native: &'a [u64],
+}
+
+impl<'a> WikidataPropIndex<'a> {
+    fn try_from(raw: &'a [u8]) -> Result<Self> {
+        let mut buf8 = [0u8; 8];
+        if raw.len() < 8 {
+            return Err(ErrorKind::Msg("wikidata prop index: unexpected EOF".to_string()).into());
+        }
+        let (n_props_b, rest) = raw.split_at(8);
+        buf8.copy_from_slice(n_props_b);
+        let n_props = u64::from_le_bytes(buf8) as usize;
+
+        let n_ptrs = n_props + 1;
+        let ptr_segment_size = std::mem::size_of::<WikidataPropPtr>() * n_ptrs;
+        if rest.len() < ptr_segment_size {
+            return Err(ErrorKind::Msg("wikidata props index: unexpected EOF".to_string()).into());
+        }
+        let (ptr_segment_b, data_b) = rest.split_at(ptr_segment_size);
+        let ptrs: &'a [WikidataPropPtr] = unsafe {
+            std::slice::from_raw_parts(std::mem::transmute(ptr_segment_b.as_ptr()), n_ptrs)
+        };
+
+        if data_b.len() % 8 != 0 {
+            return Err(ErrorKind::Msg(
+                "wikidata props index: size must be multiple of 8".to_string(),
+            )
+            .into());
+        }
+        let data_len = data_b.len() / 8;
+        let data_native: &'a [u64] =
+            unsafe { std::slice::from_raw_parts(std::mem::transmute(data_b.as_ptr()), data_len) };
+        for ptr in ptrs {
+            let d_offset = (ptr.data_offset() as usize)
+                .checked_sub(8 + ptr_segment_size)
+                .ok_or_else(|| {
+                    ErrorKind::Msg("wikidata props index: ptr.data_offset is invalid".to_string())
+                })?;
+            if d_offset % 8 != 0 {
+                return Err(ErrorKind::Msg(
+                    "wikidata props index: ptr.data_offset is invalid".to_string(),
+                )
+                .into());
+            }
+            if (d_offset / 8) + ptr.num_entities() > data_len {
+                return Err(
+                    ErrorKind::Msg("wikidata props index: ptr is invalid".to_string()).into(),
+                );
+            }
+        }
+
+        Ok(WikidataPropIndex {
+            _raw: raw,
+            ptrs,
+            data_native,
+        })
+    }
+
+    fn get_entity_ids_native(&self, prop_id: u64) -> &'a [u64] {
+        let ptr_segment_size = std::mem::size_of::<WikidataPropPtr>() * self.ptrs.len();
+
+        let p_index = (prop_id & ENTITY_NUM_MASK) as usize;
+        let Some(ptr) = self.ptrs.get(p_index) else {
+            return &[];
+        };
+
+        let d_index = (ptr.data_offset() as usize - 8 - ptr_segment_size) / 8;
+
+        &self.data_native[d_index..d_index + ptr.num_entities()]
+    }
+
+    #[cfg(target_endian = "little")]
+    fn get_entity_ids(&self, prop_id: u64) -> impl Iterator<Item = u64> + 'a {
+        return self.get_entity_ids_native(prop_id).iter().copied();
+    }
+
+    #[cfg(target_endian = "big")]
+    fn get_entity_ids(&self, prop_id: u64) -> impl Iterator<Item = u64> + 'a {
+        return self
+            .get_entity_ids_native(prop_id)
+            .iter()
+            .map(|x| x.swap_bytes());
+    }
 }
 
 struct WikidataNode<'a> {
@@ -264,7 +381,9 @@ impl<'a> WikidataIndex<'a> {
     }
 
     fn slice_leaves(&self, start: usize, end: usize) -> impl Iterator<Item = (u64, u32)> + 'a {
-        self.leaf_level_native[start..end].iter().map(|leaf| (leaf.data_offset(), leaf.data_length()))
+        self.leaf_level_native[start..end]
+            .iter()
+            .map(|leaf| (leaf.data_offset(), leaf.data_length()))
     }
 
     fn get_many(&self, query_keys: &[u64]) -> Vec<(u64, u32)> {
@@ -417,6 +536,7 @@ enum QueryType {
     Id,
     IdRange,
     Title,
+    HasProp,
 }
 
 #[derive(Debug, Clone)]
@@ -448,13 +568,17 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
     let base = path.strip_suffix(".zst").unwrap_or(path);
     let dicts_path = base.to_string() + ".zdicts";
     let index_path = base.to_string() + ".index.bin";
+    let prop_index_path = base.to_string() + "-prop.index.bin";
     let en_index_path = base.to_string() + "-en.index.txt";
 
     let index_file = OpenOptions::new().read(true).open(index_path)?;
+    let prop_index_file = OpenOptions::new().read(true).open(prop_index_path)?;
     let en_index = read_en_index_file(&en_index_path)?;
 
     let index_mapped = unsafe { Mmap::map(&index_file)? };
     let wd_index = WikidataIndex::try_from(&index_mapped[..])?;
+    let prop_index_mapped = unsafe { Mmap::map(&prop_index_file)? };
+    let wd_prop_index = WikidataPropIndex::try_from(&prop_index_mapped[..])?;
     let dicts = read_dicts_file(&wd_index, &dicts_path)?;
     let data_file_shared = StdMutex::new(OpenOptions::new().read(true).open(path)?);
     // let summary: Vec<_> = dicts.iter().map(|(k, v)| (k, v.as_ddict().get_dict_id())).collect();
@@ -521,7 +645,9 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                                 let start_opt = parse_entity_id(start_s);
                                 let end_opt = parse_entity_id(end_s);
                                 start_opt.and_then(|start| {
-                                    end_opt.filter(|end| *end >= start).map(|end| Range { start, end }.into())
+                                    end_opt
+                                        .filter(|end| *end >= start)
+                                        .map(|end| Range { start, end }.into())
                                 })
                             }
                             _ => {
@@ -541,6 +667,24 @@ async fn serve_async(path: &str, port: u16) -> Result<()> {
                                 .collect::<Vec<_>>()
                                 .into(),
                         ),
+                        QueryType::HasProp => {
+                            if let Some(prop_ids) = query
+                                .args
+                                .into_iter()
+                                .map(|id| parse_entity_id(&id))
+                                .collect::<Option<Vec<_>>>()
+                            {
+                                Some(
+                                    prop_ids
+                                        .into_iter()
+                                        .flat_map(|id| wd_prop_index.get_entity_ids(id))
+                                        .collect::<Vec<_>>()
+                                        .into(),
+                                )
+                            } else {
+                                None
+                            }
+                        }
                     };
                     let query_args = match query_args {
                         Some(a) => a,
